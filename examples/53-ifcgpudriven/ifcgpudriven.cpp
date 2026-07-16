@@ -550,6 +550,7 @@ public:
 		m_heading   = 0.7f;
 		m_pitch     = 0.5f;
 		m_distance  = m_scene.radius * 2.0f;
+		m_target    = bx::Vec3(m_scene.center[0], m_scene.center[1], m_scene.center[2]);
 		m_frustumCull = true;
 
 		bgfx::setViewClear(kViewDepth, BGFX_CLEAR_DEPTH, 0x000000ff, 1.0f, 0);
@@ -706,7 +707,9 @@ public:
 
 		float view[16];
 		float proj[16];
-		bx::mtxLookAt(view, m_eye, m_at);
+		// Z-up scene: pass up = +Z. The default +Y up renders the model on its
+		// side / upside-down.
+		bx::mtxLookAt(view, m_eye, m_at, bx::Vec3(0.0f, 0.0f, 1.0f));
 		bx::mtxProj(proj, 60.0f, float(m_width) / float(m_height), 0.05f,
 			m_scene.radius * 6.0f + m_distance, bgfx::getCaps()->homogeneousDepth);
 
@@ -814,16 +817,37 @@ public:
 
 	void updateCamera()
 	{
+		// Controls: left-drag orbit, right/middle-drag pan (moves target),
+		// wheel zoom (multiplicative). Matches the bim-viewer camera.
 		const bool overGui = ImGui::MouseOverArea();
 		if (!overGui)
 		{
+			const float dx = float(m_mouseState.m_mx - m_prevMx);
+			const float dy = float(m_mouseState.m_my - m_prevMy);
 			if (m_mouseState.m_buttons[entry::MouseButton::Left])
 			{
 				if (m_dragging)
 				{
-					m_heading += (m_mouseState.m_mx - m_prevMx) * 0.005f;
-					m_pitch   -= (m_mouseState.m_my - m_prevMy) * 0.005f;
+					m_heading -= dx * 0.005f;
+					m_pitch   += dy * 0.005f;
 					m_pitch = bx::clamp(m_pitch, -1.5f, 1.5f);
+				}
+				m_dragging = true;
+			}
+			else if (m_mouseState.m_buttons[entry::MouseButton::Right]
+			     ||  m_mouseState.m_buttons[entry::MouseButton::Middle])
+			{
+				if (m_dragging)
+				{
+					// Pan in the view plane, scaled with distance so the scene
+					// tracks the cursor. Uses last frame's view basis.
+					float v[16];
+					bx::mtxLookAt(v, m_eye, m_at, bx::Vec3(0.0f, 0.0f, 1.0f));
+					const bx::Vec3 right(v[0], v[4], v[8]);
+					const bx::Vec3 up   (v[1], v[5], v[9]);
+					const float s = m_distance * 0.0015f;
+					m_target = bx::add(m_target,
+						bx::add(bx::mul(right, -dx * s), bx::mul(up, dy * s)));
 				}
 				m_dragging = true;
 			}
@@ -834,20 +858,21 @@ public:
 			int mz = m_mouseState.m_mz - m_prevMz;
 			if (mz != 0)
 				m_distance *= bx::pow(0.9f, float(mz));
-			m_distance = bx::max(m_distance, m_scene.radius * 0.01f);
+			m_distance = bx::clamp(m_distance,
+				m_scene.radius * 0.001f, m_scene.radius * 20.0f);
 		}
 		m_prevMx = m_mouseState.m_mx;
 		m_prevMy = m_mouseState.m_my;
 		m_prevMz = m_mouseState.m_mz;
 
-		// IFC is Z-up: build eye around center
+		// IFC is Z-up: orbit the eye around the movable target.
 		float cp = bx::cos(m_pitch);
 		float dir[3] = { cp * bx::sin(m_heading), cp * bx::cos(m_heading), bx::sin(m_pitch) };
 		m_eye = bx::Vec3(
-			m_scene.center[0] + dir[0] * m_distance,
-			m_scene.center[1] + dir[1] * m_distance,
-			m_scene.center[2] + dir[2] * m_distance);
-		m_at = bx::Vec3(m_scene.center[0], m_scene.center[1], m_scene.center[2]);
+			m_target.x + dir[0] * m_distance,
+			m_target.y + dir[1] * m_distance,
+			m_target.z + dir[2] * m_distance);
+		m_at = m_target;
 	}
 
 	// view ids (executed in ascending order)
@@ -906,6 +931,7 @@ public:
 
 	// camera
 	float m_heading = 0, m_pitch = 0, m_distance = 10.0f;
+	bx::Vec3 m_target = bx::Vec3(0.0f);
 	bx::Vec3 m_eye = bx::Vec3(0.0f);
 	bx::Vec3 m_at  = bx::Vec3(0.0f);
 	bool  m_dragging = false;
