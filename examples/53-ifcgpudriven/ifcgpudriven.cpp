@@ -426,6 +426,12 @@ void loadDatabase(const std::string& path, Scene& scene, float bmin[3], float bm
 				memcpy(ir.mtx, mp, sizeof(mp));
 				ir.color[0] = seg.color[0]; ir.color[1] = seg.color[1];
 				ir.color[2] = seg.color[2]; ir.color[3] = seg.alpha;
+				// Carry the draw-item index in mtx[3] (= i_data0.w, col0.w of an
+				// affine matrix, so always 0 and otherwise wasted). bgfx caps
+				// instance data at 5 vec4, so there is no room for a 6th
+				// attribute. vs_ifc.sc reads it for the anti-z-fighting nudge and
+				// rebuilds the matrix with w = 0. Exact as f32 (only % 32 used).
+				ir.mtx[3] = float(scene.instances.size());
 				scene.instances.push_back(ir);
 
 				const uint32_t transparent = (seg.alpha < 0.99f) ? 1u : 0u;
@@ -580,9 +586,11 @@ public:
 		m_progDepth     = bgfx::createProgram(loadShader("vs_ifc_depth"), true);  // vertex-only (depth target)
 		m_progReset     = bgfx::createProgram(loadShader("cs_ifc_reset"), true);
 		m_progCull      = bgfx::createProgram(loadShader("cs_ifc_cull"),  true);
-		// reuse example 37's generic Hi-Z build shaders (already compiled to spirv)
-		m_progCopyZ     = bgfx::createProgram(loadShader("cs_gdr_copy_z"),         true);
-		m_progDownscale = bgfx::createProgram(loadShader("cs_gdr_downscale_hi_z"), true);
+		// copy_z is a straight texel copy, so it is convention-agnostic and can be
+		// reused from example 37. The downscale is NOT: it reduces a 2x2 block and
+		// reverse-Z needs min where 37 needs max, hence the private copy.
+		m_progCopyZ     = bgfx::createProgram(loadShader("cs_gdr_copy_z"),          true);
+		m_progDownscale = bgfx::createProgram(loadShader("cs_ifc_downscale_hi_z"),  true);
 
 		u_cullParams        = bgfx::createUniform("u_cullParams",        bgfx::UniformType::Vec4);
 		u_hiZSize           = bgfx::createUniform("u_hiZSize",           bgfx::UniformType::Vec4);
@@ -593,6 +601,9 @@ public:
 		s_opaqueColor       = bgfx::createUniform("s_opaqueColor",       bgfx::UniformType::Sampler);
 		s_accum             = bgfx::createUniform("s_accum",             bgfx::UniformType::Sampler);
 		s_reveal            = bgfx::createUniform("s_reveal",            bgfx::UniformType::Sampler);
+		s_depth             = bgfx::createUniform("s_depth",             bgfx::UniformType::Sampler);
+		u_edlParams         = bgfx::createUniform("u_edlParams",         bgfx::UniformType::Vec4);
+		u_edlColor          = bgfx::createUniform("u_edlColor",          bgfx::UniformType::Vec4);
 
 		// WBOIT needs per-render-target blend states (additive accum + multiplicative
 		// revealage in one pass). Without it the transparent pass cannot work.
@@ -606,8 +617,13 @@ public:
 		m_target    = bx::Vec3(m_scene.center[0], m_scene.center[1], m_scene.center[2]);
 		m_frustumCull = true;
 
-		bgfx::setViewClear(kViewDepth, BGFX_CLEAR_DEPTH, 0x000000ff, 1.0f, 0);
-		bgfx::setViewClear(kViewRender, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x303030ff, 1.0f, 0);
+		// REVERSE-Z everywhere: clear depth to 0 (the far plane) instead of 1.
+		// Requires a 0..1 depth range; on a homogeneous-depth backend (GL/GLES,
+		// -1..1) reverse-Z buys nothing and the compares below would be wrong.
+		BX_WARN(!bgfx::getCaps()->homogeneousDepth
+			, "53-ifcgpudriven: reverse-Z path assumes a 0..1 depth range (D3D/Vulkan/Metal).");
+		bgfx::setViewClear(kViewDepth, BGFX_CLEAR_DEPTH, 0x000000ff, 0.0f, 0);
+		bgfx::setViewClear(kViewRender, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x303030ff, 0.0f, 0);
 
 		// WBOIT targets need different clear values per attachment, which needs the
 		// clear-colour palette: accum -> 0 (additive sum), revealage -> 1 (product
@@ -710,10 +726,28 @@ public:
 		// BackbufferRatio::Equal so bgfx re-creates these at the new size on every
 		// reset (window resize / fullscreen). Fixed-size targets would stay at the
 		// startup resolution and the composite would just upscale them.
-		m_colorTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::BGRA8,   tsFlags);
-		m_mainDepth = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::D32F,    tsFlags);
-		m_accumTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::RGBA16F, tsFlags);
-		m_revealTex = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::R16F,    tsFlags);
+		//
+		// MSAA: the frame resolves through a fullscreen composite quad, so
+		// BGFX_RESET_MSAA_* on the backbuffer would antialias nothing -- the real
+		// geometry edges land here. MSAA shades once per pixel (only coverage is
+		// per-sample), so unlike supersampling it is affordable on a fill-bound
+		// draw. bgfx resolves an MSAA render target automatically when it is
+		// sampled, so the composite reads colour/accum/reveal as normal.
+		//
+		// All attachments of a framebuffer must agree on sample count, so the
+		// WBOIT targets are MSAA too.
+		const uint64_t msaaFlags = m_msaa ? BGFX_TEXTURE_RT_MSAA_X4 : BGFX_TEXTURE_NONE;
+		m_colorTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::BGRA8,   tsFlags | msaaFlags);
+		m_accumTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::RGBA16F, tsFlags | msaaFlags);
+		m_revealTex = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::R16F,    tsFlags | msaaFlags);
+		// Depth is the awkward one. bgfx rejects an MSAA depth attachment unless
+		// it is RT_WRITE_ONLY or MSAA_SAMPLE ("depth textures do not support MSAA
+		// resolve"). Example 09-hdr uses WRITE_ONLY because it never reads depth;
+		// EDL *does* read it, so this has to be MSAA_SAMPLE and the composite
+		// fetches it through a sampler2DMS instead of a plain sampler2D.
+		m_mainDepth = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::D32F
+			, tsFlags | msaaFlags | (m_msaa ? BGFX_TEXTURE_MSAA_SAMPLE : 0)
+			);
 
 		// NOTE: Attachment::init defaults _resolve to BGFX_RESOLVE_AUTO_GEN_MIPS,
 		// which bgfx rejects on a depth attachment ("Depth textures do not support
@@ -729,6 +763,7 @@ public:
 		oitAtt[1].init(m_revealTex, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
 		oitAtt[2].init(m_mainDepth, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);  // shared with opaque
 		m_oitFb = bgfx::createFrameBuffer(BX_COUNTOF(oitAtt), oitAtt, false);
+
 	}
 
 	virtual int shutdown() override
@@ -778,6 +813,9 @@ public:
 		bgfx::destroy(s_opaqueColor);
 		bgfx::destroy(s_accum);
 		bgfx::destroy(s_reveal);
+		bgfx::destroy(s_depth);
+		bgfx::destroy(u_edlParams);
+		bgfx::destroy(u_edlColor);
 		bgfx::shutdown();
 		return 0;
 	}
@@ -801,6 +839,12 @@ public:
 		ImGui::Checkbox("Frustum cull", &m_frustumCull);
 		ImGui::Checkbox("Occlusion cull (Hi-Z)", &m_occlusionCull);
 		ImGui::SliderFloat("Min pixel size", &m_minPixelSize, 0.0f, 8.0f);
+		ImGui::Separator();
+		ImGui::Text("Edge darkening (EDL)");
+		ImGui::SliderFloat("Strength", &m_edlStrength, 0.0f, 2.0f);
+		ImGui::SliderFloat("Radius (px)", &m_edlRadius, 1.0f, 4.0f);
+		ImGui::SliderFloat("Max darken", &m_edlMaxDarken, 0.0f, 1.0f);
+		ImGui::Separator();
 		ImGui::Text("Instances: %u", m_numInstances);
 		ImGui::Text("Triangles: %llu", (unsigned long long)m_scene.numTriangles);
 		ImGui::End();
@@ -815,8 +859,32 @@ public:
 		// Z-up scene: pass up = +Z. The default +Y up renders the model on its
 		// side / upside-down.
 		bx::mtxLookAt(view, m_eye, m_at, bx::Vec3(0.0f, 0.0f, 1.0f));
-		bx::mtxProj(proj, 60.0f, float(m_width) / float(m_height), 0.05f,
-			m_scene.radius * 6.0f + m_distance, bgfx::getCaps()->homogeneousDepth);
+		// Eye-adaptive near/far, bounded to the scene sphere around the eye
+		// (ported from the bim-viewer camera).
+		//
+		// The old fixed near = 0.05 with far ~ 6*radius gave a ~48000:1 ratio at
+		// overview distance. Depth resolution collapses at that ratio -- roughly
+		// 10 cm at 300 m on a 24-bit standard-Z buffer -- so every slab, roof and
+		// facade within 10 cm of each other tied and fought per-pixel. Deriving
+		// near from the eye's actual distance to the geometry keeps the ratio
+		// tight at any camera position (overview: ~3:1, i.e. sub-mm).
+		const float camNear = bx::max(m_distance - m_scene.radius
+			, bx::max(m_scene.radius * 1e-4f, 0.05f)
+			);
+		const float camFar = bx::max( (m_distance + m_scene.radius) * 1.05f
+			, camNear * 1.001f
+			);
+		// REVERSE-Z: near and far are swapped, so near maps to 1 and far to 0.
+		// Paired with a depth clear of 0 and CompareFunction GREATER, plus a
+		// min-reduced Hi-Z pyramid (see cs_ifc_downscale_hi_z).
+		//
+		// Float depth bunches its precision near 0; standard Z puts the far plane
+		// there, which is exactly backwards. Reversing spreads the precision
+		// almost uniformly over the view range, which is what makes the per-item
+		// depth nudge in vs_ifc.sc actually bite (a nudge scaled by ndc_z is zero
+		// at the near plane under standard Z, since near maps to 0 there).
+		bx::mtxProj(proj, 60.0f, float(m_width) / float(m_height), camFar, camNear
+			, bgfx::getCaps()->homogeneousDepth);
 
 		if (m_numInstances > 0)
 		{
@@ -830,7 +898,7 @@ public:
 			bgfx::setVertexBuffer(0, m_vbh);
 			bgfx::setIndexBuffer(m_ibh);
 			bgfx::setInstanceDataBuffer(m_instanceVbh, 0, m_numInstances);
-			bgfx::setState(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS);
+			bgfx::setState(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_GREATER);  // reverse-Z
 			bgfx::submit(kViewDepth, m_progDepth, m_occIndirect[prev], 0, m_occCount[prev], 0, uint32_t(m_numInstances));
 
 			// Hi-Z build: copy depth -> mip0
@@ -895,7 +963,15 @@ public:
 			bgfx::setVertexBuffer(0, m_vbh);
 			bgfx::setIndexBuffer(m_ibh);
 			bgfx::setInstanceDataBuffer(m_instanceVbh, 0, m_numInstances);
-			bgfx::setState(BGFX_STATE_DEFAULT);
+			// BGFX_STATE_DEFAULT minus DEPTH_TEST_LESS, plus GREATER (reverse-Z).
+			bgfx::setState(0
+				| BGFX_STATE_WRITE_RGB
+				| BGFX_STATE_WRITE_A
+				| BGFX_STATE_WRITE_Z
+				| BGFX_STATE_DEPTH_TEST_GREATER
+				| BGFX_STATE_CULL_CW
+				| BGFX_STATE_MSAA
+				);
 			bgfx::submit(kViewRender, m_progRender, m_indirect[cur], 0, m_count[cur], 0, uint32_t(m_numInstances));
 
 			// pass: accumulate the transparent visible set (weighted-blended OIT).
@@ -911,7 +987,7 @@ public:
 			bgfx::setState(0
 				| BGFX_STATE_WRITE_RGB
 				| BGFX_STATE_WRITE_A
-				| BGFX_STATE_DEPTH_TEST_LESS
+				| BGFX_STATE_DEPTH_TEST_GREATER  // reverse-Z
 				| BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE)  // RT0 accum: additive
 				| BGFX_STATE_BLEND_INDEPENDENT
 				, 0
@@ -930,6 +1006,15 @@ public:
 				bgfx::setTexture(0, s_opaqueColor, m_colorTex);
 				bgfx::setTexture(1, s_accum,       m_accumTex);
 				bgfx::setTexture(2, s_reveal,      m_revealTex);
+				bgfx::setTexture(3, s_depth,       m_mainDepth);
+				// EDL: strength, radius (px), max darken. Defaults from the
+				// bim-viewer; max darken well below 1 keeps edges a soft
+				// separation shade rather than a hard outline.
+				float edlParams[4] = { m_edlStrength, m_edlRadius, m_edlMaxDarken, 0.0f };
+				bgfx::setUniform(u_edlParams, edlParams);
+				// Linear-space grey, slightly cool to match the background.
+				float edlColor[4] = { 0.30f, 0.30f, 0.33f, 0.0f };
+				bgfx::setUniform(u_edlColor, edlColor);
 				bgfx::setState(BGFX_STATE_WRITE_RGB);
 				screenSpaceQuad(bgfx::getCaps()->originBottomLeft);
 				bgfx::submit(kViewComposite, m_progComposite);
@@ -1077,6 +1162,17 @@ public:
 	bgfx::UniformHandle s_opaqueColor       = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle s_accum             = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle s_reveal            = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle s_depth             = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle u_edlParams         = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle u_edlColor          = BGFX_INVALID_HANDLE;
+
+	// eye-dome lighting (edge darkening); 0 strength disables it
+	float m_edlStrength  = 1.0f;
+	float m_edlRadius    = 1.0f;
+	float m_edlMaxDarken = 0.45f;
+	// MSAA x4 on the offscreen targets. Fixed at init: the sample count is baked
+	// into the textures and the composite's depth sampler.
+	bool  m_msaa = true;
 	bool m_occlusionCull = true;
 	float m_minPixelSize = 2.0f;  // small-object cull threshold (projected px)
 

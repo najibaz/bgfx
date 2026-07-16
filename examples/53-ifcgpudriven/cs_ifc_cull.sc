@@ -57,7 +57,9 @@ void main()
 	bool doOcclusion = u_cullParams.z > 0.5;
 
 	int outL = 0, outR = 0, outB = 0, outT = 0, outN = 0, outF = 0;
-	float minZ = 1.0;
+	// REVERSE-Z: near is 1 and far is 0, so the NEAREST corner is the one with
+	// the LARGEST depth -- track a max, seeded at the far plane.
+	float nearZ = 0.0;
 	vec2 minXY = vec2(1.0, 1.0);
 	vec2 maxXY = vec2(0.0, 0.0);
 
@@ -70,22 +72,19 @@ void main()
 		if (c.x >  c.w) outR++;
 		if (c.y < -c.w) outB++;
 		if (c.y >  c.w) outT++;
-#if BGFX_SHADER_LANGUAGE_GLSL
-		if (c.z < -c.w) outN++;
-		c.z = 0.5 * (c.z + c.w);
-#else
-		if (c.z < 0.0)  outN++;
-#endif
-		if (c.z >  c.w) outF++;
+		// REVERSE-Z inverts the depth planes: nearer than near is z > w, and
+		// beyond far is z < 0 (the opposite of a standard 0..1 projection).
+		if (c.z >  c.w) outN++;
+		if (c.z <  0.0) outF++;
 
-		// screen-space AABB + min depth (clamped)
+		// screen-space AABB + nearest depth (clamped)
 		c.z = max(c.z, 0.0);
 		vec3 ndc = c.xyz / c.w;
 		ndc.xy = clamp(ndc.xy, -1.0, 1.0);
 		vec2 uv = ndc.xy * vec2(0.5, -0.5) + vec2(0.5, 0.5);
 		minXY = min(uv, minXY);
 		maxXY = max(uv, maxXY);
-		minZ = saturate(min(minZ, ndc.z));
+		nearZ = saturate(max(nearZ, ndc.z));
 	}
 
 	bool visible = true;
@@ -125,9 +124,13 @@ void main()
 			, texture2DLod(s_hiZ, boxUVs.xw, mip).x
 			, texture2DLod(s_hiZ, boxUVs.zw, mip).x
 			);
-		float maxDepth = max(max(depth.x, depth.y), max(depth.z, depth.w));
+		// REVERSE-Z: the pyramid is min-reduced and stores the farthest occluder,
+		// which is the SMALLEST value. Take the min of the four taps to stay
+		// conservative, and cull only when the item's nearest point is still
+		// behind that occluder -- which, with near = 1, means a smaller value.
+		float occluderFar = min(min(depth.x, depth.y), min(depth.z, depth.w));
 
-		if (minZ > maxDepth)
+		if (nearZ < occluderFar)
 			visible = false;
 	}
 
