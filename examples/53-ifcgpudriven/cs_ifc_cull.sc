@@ -106,8 +106,18 @@ void main()
 		float mip = ceil(log2(float(max(size.x, size.y))));
 		mip = clamp(mip, 0.0, u_cullParams.w);
 
+		// Drop to the next finer mip only if the footprint still fits in 2x2
+		// texels there (4 taps then cover it).
+		//
+		// NOTE: example 37 scales the box by exp2(-level) alone, but boxUVs are
+		// UVs in [0,1] -- without multiplying by the Hi-Z size these are not
+		// texel coords, floor/ceil snap them to 0/1, and the test is ~always
+		// true, so the mip is *always* dropped and the 4 taps under-cover the
+		// footprint. Under-covering means the taps can miss the gap an item is
+		// actually visible through, and it gets culled. Scale by the mip's texel
+		// dimensions so the 2x2 test means what it says.
 		float levelLower = max(mip - 1.0, 0.0);
-		vec2 scale = vec2_splat(exp2(-levelLower));
+		vec2 scale = u_hiZSize.xy * exp2(-levelLower);
 		vec2 a = floor(boxUVs.xy * scale);
 		vec2 b = ceil(boxUVs.zw * scale);
 		vec2 dims = b - a;
