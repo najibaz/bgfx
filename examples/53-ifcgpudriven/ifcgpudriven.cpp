@@ -62,6 +62,48 @@ struct InstanceRender
 	float color[4]; // i_data4
 };
 
+// fullscreen triangle for the WBOIT composite pass
+struct PosTexCoord0Vertex
+{
+	float m_x, m_y, m_z;
+	float m_u, m_v;
+	static void init()
+	{
+		ms_layout.begin()
+			.add(bgfx::Attrib::Position,  3, bgfx::AttribType::Float)
+			.add(bgfx::Attrib::TexCoord0, 2, bgfx::AttribType::Float)
+			.end();
+	}
+	static bgfx::VertexLayout ms_layout;
+};
+bgfx::VertexLayout PosTexCoord0Vertex::ms_layout;
+
+void screenSpaceQuad(bool _originBottomLeft)
+{
+	if (3 == bgfx::getAvailTransientVertexBuffer(3, PosTexCoord0Vertex::ms_layout))
+	{
+		bgfx::TransientVertexBuffer vb;
+		bgfx::allocTransientVertexBuffer(&vb, 3, PosTexCoord0Vertex::ms_layout);
+		PosTexCoord0Vertex* vertex = (PosTexCoord0Vertex*)vb.data;
+
+		const float minx = -1.0f, maxx = 1.0f;
+		const float miny =  0.0f, maxy = 2.0f;
+		const float minu = -1.0f, maxu = 1.0f;
+		float minv = 0.0f, maxv = 2.0f;
+		if (_originBottomLeft)
+		{
+			float tmp = minv; minv = maxv; maxv = tmp;
+			minv -= 1.0f; maxv -= 1.0f;
+		}
+
+		vertex[0].m_x = minx; vertex[0].m_y = miny; vertex[0].m_z = 0.0f; vertex[0].m_u = minu; vertex[0].m_v = minv;
+		vertex[1].m_x = maxx; vertex[1].m_y = miny; vertex[1].m_z = 0.0f; vertex[1].m_u = maxu; vertex[1].m_v = minv;
+		vertex[2].m_x = maxx; vertex[2].m_y = maxy; vertex[2].m_z = 0.0f; vertex[2].m_u = maxu; vertex[2].m_v = maxv;
+
+		bgfx::setVertexBuffer(0, &vb);
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 
@@ -481,6 +523,7 @@ public:
 		bgfx::setDebug(m_debug);
 
 		PosVertex::init();
+		PosTexCoord0Vertex::init();
 
 		// collect .db paths from the command line
 		std::vector<std::string> dbPaths;
@@ -532,6 +575,8 @@ public:
 
 		// programs
 		m_progRender    = loadProgram("vs_ifc", "fs_ifc");
+		m_progOit       = loadProgram("vs_ifc", "fs_ifc_oit");        // WBOIT accumulate
+		m_progComposite = loadProgram("vs_ifc_composite", "fs_ifc_composite");
 		m_progDepth     = bgfx::createProgram(loadShader("vs_ifc_depth"), true);  // vertex-only (depth target)
 		m_progReset     = bgfx::createProgram(loadShader("cs_ifc_reset"), true);
 		m_progCull      = bgfx::createProgram(loadShader("cs_ifc_cull"),  true);
@@ -545,6 +590,14 @@ public:
 		u_inputRTSize       = bgfx::createUniform("u_inputRTSize",       bgfx::UniformType::Vec4);
 		s_hiZ               = bgfx::createUniform("s_hiZ",               bgfx::UniformType::Sampler);
 		s_texOcclusionDepth = bgfx::createUniform("s_texOcclusionDepth", bgfx::UniformType::Sampler);
+		s_opaqueColor       = bgfx::createUniform("s_opaqueColor",       bgfx::UniformType::Sampler);
+		s_accum             = bgfx::createUniform("s_accum",             bgfx::UniformType::Sampler);
+		s_reveal            = bgfx::createUniform("s_reveal",            bgfx::UniformType::Sampler);
+
+		// WBOIT needs per-render-target blend states (additive accum + multiplicative
+		// revealage in one pass). Without it the transparent pass cannot work.
+		BX_ASSERT(0 != (bgfx::getCaps()->supported & BGFX_CAPS_BLEND_INDEPENDENT)
+			, "BGFX_CAPS_BLEND_INDEPENDENT required for weighted-blended OIT");
 
 		// camera
 		m_heading   = 0.7f;
@@ -555,6 +608,14 @@ public:
 
 		bgfx::setViewClear(kViewDepth, BGFX_CLEAR_DEPTH, 0x000000ff, 1.0f, 0);
 		bgfx::setViewClear(kViewRender, BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH, 0x303030ff, 1.0f, 0);
+
+		// WBOIT targets need different clear values per attachment, which needs the
+		// clear-colour palette: accum -> 0 (additive sum), revealage -> 1 (product
+		// of transmittances). Depth is NOT cleared here: the OIT pass tests against
+		// the opaque depth written by kViewRender into the shared depth texture.
+		bgfx::setPaletteColor(0, 0.0f, 0.0f, 0.0f, 0.0f);
+		bgfx::setPaletteColor(1, 1.0f, 1.0f, 1.0f, 1.0f);
+		bgfx::setViewClear(kViewRenderT, BGFX_CLEAR_COLOR, 1.0f, 0, 0, 1);
 
 		const char* shot = getenv("IFC_SHOT");
 		if (shot)
@@ -637,6 +698,37 @@ public:
 			bgfx::TextureFormat::D32F, tsFlags);
 		m_hizTex = bgfx::createTexture2D(uint16_t(m_hizW), uint16_t(m_hizH), true, 1,
 			bgfx::TextureFormat::R32F, BGFX_TEXTURE_COMPUTE_WRITE | tsFlags);
+
+		// Offscreen targets for the WBOIT path.
+		//
+		// The opaque pass can no longer draw straight to the backbuffer: the
+		// transparent pass must depth-test against the opaque depth, and the
+		// composite must read the opaque colour. Neither is possible with the
+		// backbuffer's implicit depth, so opaque renders to its own colour+depth
+		// textures and the OIT framebuffer re-attaches that same depth texture
+		// (test only, no write).
+		// BackbufferRatio::Equal so bgfx re-creates these at the new size on every
+		// reset (window resize / fullscreen). Fixed-size targets would stay at the
+		// startup resolution and the composite would just upscale them.
+		m_colorTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::BGRA8,   tsFlags);
+		m_mainDepth = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::D32F,    tsFlags);
+		m_accumTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::RGBA16F, tsFlags);
+		m_revealTex = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::R16F,    tsFlags);
+
+		// NOTE: Attachment::init defaults _resolve to BGFX_RESOLVE_AUTO_GEN_MIPS,
+		// which bgfx rejects on a depth attachment ("Depth textures do not support
+		// MSAA resolve") -> createFrameBuffer returns an invalid handle. None of
+		// these targets have mips, so resolve NONE everywhere.
+		bgfx::Attachment opaqueAtt[2];
+		opaqueAtt[0].init(m_colorTex,  bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
+		opaqueAtt[1].init(m_mainDepth, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
+		m_opaqueFb = bgfx::createFrameBuffer(BX_COUNTOF(opaqueAtt), opaqueAtt, false);
+
+		bgfx::Attachment oitAtt[3];
+		oitAtt[0].init(m_accumTex,  bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
+		oitAtt[1].init(m_revealTex, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
+		oitAtt[2].init(m_mainDepth, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);  // shared with opaque
+		m_oitFb = bgfx::createFrameBuffer(BX_COUNTOF(oitAtt), oitAtt, false);
 	}
 
 	virtual int shutdown() override
@@ -661,7 +753,17 @@ public:
 		}
 		if (bgfx::isValid(m_depthFb)) bgfx::destroy(m_depthFb);
 		if (bgfx::isValid(m_hizTex))  bgfx::destroy(m_hizTex);
+		// framebuffers first: they were created with destroyTextures=false because
+		// the depth texture is shared between them.
+		if (bgfx::isValid(m_opaqueFb))  bgfx::destroy(m_opaqueFb);
+		if (bgfx::isValid(m_oitFb))     bgfx::destroy(m_oitFb);
+		if (bgfx::isValid(m_colorTex))  bgfx::destroy(m_colorTex);
+		if (bgfx::isValid(m_mainDepth)) bgfx::destroy(m_mainDepth);
+		if (bgfx::isValid(m_accumTex))  bgfx::destroy(m_accumTex);
+		if (bgfx::isValid(m_revealTex)) bgfx::destroy(m_revealTex);
 		bgfx::destroy(m_progRender);
+		bgfx::destroy(m_progOit);
+		bgfx::destroy(m_progComposite);
 		bgfx::destroy(m_progDepth);
 		bgfx::destroy(m_progReset);
 		bgfx::destroy(m_progCull);
@@ -673,6 +775,9 @@ public:
 		bgfx::destroy(u_inputRTSize);
 		bgfx::destroy(s_hiZ);
 		bgfx::destroy(s_texOcclusionDepth);
+		bgfx::destroy(s_opaqueColor);
+		bgfx::destroy(s_accum);
+		bgfx::destroy(s_reveal);
 		bgfx::shutdown();
 		return 0;
 	}
@@ -781,7 +886,10 @@ public:
 			bgfx::setBuffer(8, m_occIndirect[cur], bgfx::Access::Write);
 			bgfx::dispatch(kViewCull, m_progCull, (m_numInstances + 63) / 64, 1, 1);
 
-			// pass: render visible set via indirect draw with GPU draw count
+			// pass: render opaque visible set via indirect draw with GPU draw count.
+			// Targets the offscreen colour+depth so the OIT and composite passes
+			// can read them.
+			bgfx::setViewFrameBuffer(kViewRender, m_opaqueFb);
 			bgfx::setViewTransform(kViewRender, view, proj);
 			bgfx::setViewRect(kViewRender, 0, 0, uint16_t(m_width), uint16_t(m_height));
 			bgfx::setVertexBuffer(0, m_vbh);
@@ -790,14 +898,42 @@ public:
 			bgfx::setState(BGFX_STATE_DEFAULT);
 			bgfx::submit(kViewRender, m_progRender, m_indirect[cur], 0, m_count[cur], 0, uint32_t(m_numInstances));
 
-			// pass: render transparent visible set (alpha blend, depth test, no depth write)
+			// pass: accumulate the transparent visible set (weighted-blended OIT).
+			// Depth-tests against the opaque depth but never writes it. Both blends
+			// are commutative, so the GPU-driven arbitrary draw order is harmless —
+			// this is what removes the flicker, with no sorting at all.
+			bgfx::setViewFrameBuffer(kViewRenderT, m_oitFb);
 			bgfx::setViewTransform(kViewRenderT, view, proj);
 			bgfx::setViewRect(kViewRenderT, 0, 0, uint16_t(m_width), uint16_t(m_height));
 			bgfx::setVertexBuffer(0, m_vbh);
 			bgfx::setIndexBuffer(m_ibh);
 			bgfx::setInstanceDataBuffer(m_instanceVbh, 0, m_numInstances);
-			bgfx::setState(BGFX_STATE_WRITE_RGB | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_BLEND_ALPHA);
-			bgfx::submit(kViewRenderT, m_progRender, m_transpIndirect, 0, m_transpCount, 0, uint32_t(m_numInstances));
+			bgfx::setState(0
+				| BGFX_STATE_WRITE_RGB
+				| BGFX_STATE_WRITE_A
+				| BGFX_STATE_DEPTH_TEST_LESS
+				| BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE)  // RT0 accum: additive
+				| BGFX_STATE_BLEND_INDEPENDENT
+				, 0
+				| BGFX_STATE_BLEND_FUNC_RT_1(BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_INV_SRC_COLOR)  // RT1 reveal: dst *= (1-a)
+				);
+			bgfx::submit(kViewRenderT, m_progOit, m_transpIndirect, 0, m_transpCount, 0, uint32_t(m_numInstances));
+
+			// pass: composite opaque + resolved transparency -> backbuffer
+			{
+				float ortho[16];
+				bx::mtxOrtho(ortho, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 100.0f, 0.0f,
+					bgfx::getCaps()->homogeneousDepth);
+				bgfx::setViewFrameBuffer(kViewComposite, BGFX_INVALID_HANDLE);
+				bgfx::setViewRect(kViewComposite, 0, 0, uint16_t(m_width), uint16_t(m_height));
+				bgfx::setViewTransform(kViewComposite, NULL, ortho);
+				bgfx::setTexture(0, s_opaqueColor, m_colorTex);
+				bgfx::setTexture(1, s_accum,       m_accumTex);
+				bgfx::setTexture(2, s_reveal,      m_revealTex);
+				bgfx::setState(BGFX_STATE_WRITE_RGB);
+				screenSpaceQuad(bgfx::getCaps()->originBottomLeft);
+				bgfx::submit(kViewComposite, m_progComposite);
+			}
 
 			m_pingpong = cur;
 		}
@@ -881,8 +1017,9 @@ public:
 	static const bgfx::ViewId kViewHizDown = 2;  // downscale Hi-Z mips
 	static const bgfx::ViewId kViewReset   = 3;  // zero draw counters
 	static const bgfx::ViewId kViewCull    = 4;  // cull + append commands
-	static const bgfx::ViewId kViewRender  = 5;  // render opaque visible set
-	static const bgfx::ViewId kViewRenderT = 6;  // render transparent visible set (blended)
+	static const bgfx::ViewId kViewRender    = 5;  // render opaque visible set -> offscreen
+	static const bgfx::ViewId kViewRenderT   = 6;  // accumulate transparent set (WBOIT)
+	static const bgfx::ViewId kViewComposite = 7;  // resolve OIT over opaque -> backbuffer
 
 	entry::MouseState m_mouseState;
 	uint32_t m_width = 0, m_height = 0, m_debug = 0, m_reset = 0;
@@ -914,7 +1051,18 @@ public:
 	bgfx::FrameBufferHandle m_depthFb = BGFX_INVALID_HANDLE;
 	bgfx::TextureHandle     m_hizTex  = BGFX_INVALID_HANDLE;
 
+	// WBOIT targets: opaque renders offscreen so the transparent pass can share
+	// its depth and the composite can read its colour.
+	bgfx::TextureHandle     m_colorTex  = BGFX_INVALID_HANDLE;
+	bgfx::TextureHandle     m_mainDepth = BGFX_INVALID_HANDLE;
+	bgfx::TextureHandle     m_accumTex  = BGFX_INVALID_HANDLE;
+	bgfx::TextureHandle     m_revealTex = BGFX_INVALID_HANDLE;
+	bgfx::FrameBufferHandle m_opaqueFb  = BGFX_INVALID_HANDLE;
+	bgfx::FrameBufferHandle m_oitFb     = BGFX_INVALID_HANDLE;
+
 	bgfx::ProgramHandle m_progRender    = BGFX_INVALID_HANDLE;
+	bgfx::ProgramHandle m_progOit       = BGFX_INVALID_HANDLE;
+	bgfx::ProgramHandle m_progComposite = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progDepth     = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progReset     = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progCull      = BGFX_INVALID_HANDLE;
@@ -926,6 +1074,9 @@ public:
 	bgfx::UniformHandle u_inputRTSize       = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle s_hiZ               = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle s_texOcclusionDepth = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle s_opaqueColor       = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle s_accum             = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle s_reveal            = BGFX_INVALID_HANDLE;
 	bool m_occlusionCull = true;
 	float m_minPixelSize = 2.0f;  // small-object cull threshold (projected px)
 
