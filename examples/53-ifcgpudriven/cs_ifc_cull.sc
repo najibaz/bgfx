@@ -12,7 +12,7 @@
  * u_cullParams.x = instance count
  * u_cullParams.y = frustum cull enable (0/1)
  * u_cullParams.z = occlusion cull enable (0/1)
- * u_cullParams.w = Hi-Z mip count
+ * u_cullParams.w = Hi-Z max mip INDEX (the C++ passes m_hizMips - 1, not the count)
  * u_hiZSize.xy   = Hi-Z base size in texels; .zw = 1/size
  * u_viewProj     = provided by bgfx::setViewTransform on the dispatch view
  */
@@ -62,6 +62,11 @@ void main()
 	float nearZ = 0.0;
 	vec2 minXY = vec2(1.0, 1.0);
 	vec2 maxXY = vec2(0.0, 0.0);
+	// Any corner at or behind the camera plane (w <= 0), or nearer than the near
+	// plane, makes the projected screen box meaningless: the perspective divide
+	// mirrors such a corner across the screen and clamping afterwards does not
+	// recover a conservative bound. Occlusion is skipped for those items.
+	bool badProjection = false;
 
 	for (int i = 0; i < 8; i++)
 	{
@@ -76,6 +81,9 @@ void main()
 		// beyond far is z < 0 (the opposite of a standard 0..1 projection).
 		if (c.z >  c.w) outN++;
 		if (c.z <  0.0) outF++;
+
+		if (c.w <= 0.0 || c.z > c.w)
+			badProjection = true;
 
 		// screen-space AABB + nearest depth (clamped)
 		c.z = max(c.z, 0.0);
@@ -99,11 +107,17 @@ void main()
 			visible = false;
 	}
 
-	if (visible && doOcclusion)
+	// Skipping occlusion when the projection is degenerate keeps geometry that
+	// straddles the camera visible, which is the conservative answer.
+	if (visible && doOcclusion && !badProjection)
 	{
 		vec4 boxUVs = vec4(minXY, maxXY);
-		ivec2 size = ivec2((maxXY - minXY) * u_hiZSize.xy);
-		float mip = ceil(log2(float(max(size.x, size.y))));
+
+		// max(..., 1) so a sub-texel footprint cannot feed 0 to log2 (-inf).
+		vec2 extentPx = max((maxXY - minXY) * u_hiZSize.xy, vec2_splat(1.0) );
+		float mip = ceil(log2(max(extentPx.x, extentPx.y) ) );
+		// u_cullParams.w is already the MAX MIP INDEX (the C++ passes
+		// m_hizMips - 1), so clamp straight to it.
 		mip = clamp(mip, 0.0, u_cullParams.w);
 
 		// Drop to the next finer mip only if the footprint still fits in 2x2
@@ -117,16 +131,20 @@ void main()
 		// actually visible through, and it gets culled. Scale by the mip's texel
 		// dimensions so the 2x2 test means what it says.
 		float levelLower = max(mip - 1.0, 0.0);
-		vec2 scale = u_hiZSize.xy * exp2(-levelLower);
-		vec2 a = floor(boxUVs.xy * scale);
-		vec2 b = ceil(boxUVs.zw * scale);
+		vec2 lowerMipSize = max(floor(u_hiZSize.xy * exp2(-levelLower) ), vec2_splat(1.0) );
+		vec2 a = floor(boxUVs.xy * lowerMipSize);
+		vec2 b = ceil(boxUVs.zw * lowerMipSize);
 		vec2 dims = b - a;
 		if (dims.x <= 2.0 && dims.y <= 2.0)
 			mip = levelLower;
 
 #if BGFX_SHADER_LANGUAGE_GLSL
-		boxUVs.y = 1.0 - boxUVs.y;
-		boxUVs.w = 1.0 - boxUVs.w;
+		// Flip Y about the box, not per-component: mirroring min and max
+		// independently swaps them and yields an inverted rectangle.
+		float oldMinY = boxUVs.y;
+		float oldMaxY = boxUVs.w;
+		boxUVs.y = 1.0 - oldMaxY;
+		boxUVs.w = 1.0 - oldMinY;
 #endif
 		vec4 depth = vec4(
 			  texture2DLod(s_hiZ, boxUVs.xy, mip).x
