@@ -163,24 +163,44 @@ void trsToMatrix(const float* trs, float* m)
 // ---------------------------------------------------------------------------
 // scene held on the CPU before upload
 
+// One loaded .db. The draw items of a model are contiguous (each database is
+// loaded in one go), but the cull shader does not rely on that -- every draw
+// item carries its own model index, so visibility is a per-item lookup.
+struct ModelInfo
+{
+	std::string name;        // basename of the .db, for the UI
+	uint32_t    firstItem = 0;
+	uint32_t    itemCount = 0;
+	size_t      triangles = 0;
+	bool        visible   = true;
+};
+
 struct Scene
 {
 	std::vector<int16_t>  vertices;   // quantized xyz per vertex (master buffer)
 	std::vector<uint32_t> indices;    // master index buffer
 
 	std::vector<InstanceRender> instances;   // render stream
-	std::vector<uint32_t>       drawParams;  // uvec4 per instance: indexCount, firstIndex, baseVertex, 0
+	// uvec4 per instance: indexCount, firstIndex, baseVertex, flags.
+	// flags: bit0 = transparent, bit1 = occluder, bits 8.. = model index.
+	std::vector<uint32_t>       drawParams;
 	std::vector<float>          bbox;         // 2 vec4 per instance: min.xyz,0 max.xyz,0
+
+	std::vector<ModelInfo>      models;      // one per loaded .db, indexed by drawParams flags >> 8
 
 	float center[3] = { 0, 0, 0 };
 	float radius = 1.0f;
 	size_t numTriangles = 0;
+	// Whether any material segment survived with alpha < 0.99. When nothing is
+	// transparent the whole WBOIT path (targets, clears, accumulate pass, and
+	// the composite's accum/reveal fetches) is dead weight and gets skipped.
+	bool hasTransparency = false;
 	// quantization diagnostics
 	float maxQuantErr = 0.0f;   // worst |original - dequantized| (world units)
 	float worstExtent = 0.0f;   // that geometry's AABB extent on the worst axis
 };
 
-void loadDatabase(const std::string& path, Scene& scene, float bmin[3], float bmax[3])
+void loadDatabase(const std::string& path, Scene& scene, float bmin[3], float bmax[3], uint32_t modelIdx)
 {
 	sqlite3* db = openDb(path);
 	if (!db)
@@ -192,13 +212,6 @@ void loadDatabase(const std::string& path, Scene& scene, float bmin[3], float bm
 	float dbmax[3] = { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() };
 
 	// 1) geometries -> owned CPU buffers keyed by Instance
-	struct Geom
-	{
-		const void* vBlob; int vBytes;
-		const void* iBlob; int iBytes;
-		float color[3];
-		float lmin[3], lmax[3];
-	};
 	// we must copy blob data out before stepping to the next row, so store copies
 	struct Segment
 	{
@@ -436,10 +449,14 @@ void loadDatabase(const std::string& path, Scene& scene, float bmin[3], float bm
 
 				const uint32_t transparent = (seg.alpha < 0.99f) ? 1u : 0u;
 				const uint32_t occluder    = pl.occluder ? 2u : 0u;  // bit1
+				scene.hasTransparency = scene.hasTransparency || (transparent != 0u);
 				scene.drawParams.push_back(seg.indexCount);
 				scene.drawParams.push_back(geomBaseIndex + seg.offset);
 				scene.drawParams.push_back(baseVertex);
-				scene.drawParams.push_back(transparent | occluder);
+				// bits 8.. carry the model index so the cull shader can drop a
+				// whole .db with one buffer lookup. 24 bits is far more models
+				// than the command line could ever pass.
+				scene.drawParams.push_back(transparent | occluder | (modelIdx << 8));
 
 				scene.bbox.push_back(wmin[0]); scene.bbox.push_back(wmin[1]); scene.bbox.push_back(wmin[2]); scene.bbox.push_back(0.0f);
 				scene.bbox.push_back(wmax[0]); scene.bbox.push_back(wmax[1]); scene.bbox.push_back(wmax[2]); scene.bbox.push_back(0.0f);
@@ -546,10 +563,26 @@ public:
 		float bmax[3] = { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() };
 		const int64_t tLoad = bx::getHPCounter();
 		reserveScene(dbPaths, m_scene);
+		m_scene.models.reserve(dbPaths.size());
 		for (const std::string& p : dbPaths)
 		{
 			bx::debugPrintf("Loading %s ...\n", p.c_str());
-			loadDatabase(p, m_scene, bmin, bmax);
+
+			// Register the model before loading so its index is stable while
+			// loadDatabase stamps it into every draw item it appends.
+			ModelInfo mi;
+			size_t slash = p.find_last_of("/\\");
+			mi.name = (slash == std::string::npos) ? p : p.substr(slash + 1);
+			if (mi.name.size() > 3 && mi.name.compare(mi.name.size() - 3, 3, ".db") == 0)
+				mi.name.resize(mi.name.size() - 3);
+			mi.firstItem = uint32_t(m_scene.instances.size());
+			const uint32_t modelIdx = uint32_t(m_scene.models.size());
+			m_scene.models.push_back(mi);
+
+			const size_t triBefore = m_scene.numTriangles;
+			loadDatabase(p, m_scene, bmin, bmax, modelIdx);
+			m_scene.models[modelIdx].itemCount = uint32_t(m_scene.instances.size()) - m_scene.models[modelIdx].firstItem;
+			m_scene.models[modelIdx].triangles = m_scene.numTriangles - triBefore;
 		}
 		bx::debugPrintf("Load time: %.2f s\n",
 			double(bx::getHPCounter() - tLoad) / double(bx::getHPFrequency()));
@@ -576,6 +609,9 @@ public:
 			m_scene.maxQuantErr, m_scene.maxQuantErr * 1000.0f, m_scene.worstExtent);
 		bx::debugPrintf("Instances: %u, triangles: %llu, radius: %f\n",
 			m_numInstances, (unsigned long long)m_scene.numTriangles, m_scene.radius);
+		bx::debugPrintf("Transparency: %s (WBOIT path %s)\n",
+			m_scene.hasTransparency ? "yes" : "none",
+			m_scene.hasTransparency ? "active" : "skipped -- no accum/reveal targets");
 
 		createBuffers();
 
@@ -583,6 +619,9 @@ public:
 		m_progRender    = loadProgram("vs_ifc", "fs_ifc");
 		m_progOit       = loadProgram("vs_ifc", "fs_ifc_oit");        // WBOIT accumulate
 		m_progComposite = loadProgram("vs_ifc_composite", "fs_ifc_composite");
+		// Opaque-only composite: no accum/reveal fetch, no WBOIT resolve. Picked
+		// on the CPU (not a uniform branch) so the samplers never bind.
+		m_progCompositeOpaque = loadProgram("vs_ifc_composite", "fs_ifc_composite_opaque");
 		m_progDepth     = bgfx::createProgram(loadShader("vs_ifc_depth"), true);  // vertex-only (depth target)
 		m_progReset     = bgfx::createProgram(loadShader("cs_ifc_reset"), true);
 		m_progCull      = bgfx::createProgram(loadShader("cs_ifc_cull"),  true);
@@ -593,6 +632,7 @@ public:
 		m_progDownscale = bgfx::createProgram(loadShader("cs_ifc_downscale_hi_z"),  true);
 
 		u_cullParams        = bgfx::createUniform("u_cullParams",        bgfx::UniformType::Vec4);
+		u_cullRange         = bgfx::createUniform("u_cullRange",         bgfx::UniformType::Vec4);
 		u_hiZSize           = bgfx::createUniform("u_hiZSize",           bgfx::UniformType::Vec4);
 		u_screenPixels      = bgfx::createUniform("u_screenPixels",      bgfx::UniformType::Vec4);
 		u_inputRTSize       = bgfx::createUniform("u_inputRTSize",       bgfx::UniformType::Vec4);
@@ -629,16 +669,40 @@ public:
 		// clear-colour palette: accum -> 0 (additive sum), revealage -> 1 (product
 		// of transmittances). Depth is NOT cleared here: the OIT pass tests against
 		// the opaque depth written by kViewRender into the shared depth texture.
-		bgfx::setPaletteColor(0, 0.0f, 0.0f, 0.0f, 0.0f);
-		bgfx::setPaletteColor(1, 1.0f, 1.0f, 1.0f, 1.0f);
-		bgfx::setViewClear(kViewRenderT, BGFX_CLEAR_COLOR, 1.0f, 0, 0, 1);
+		if (m_scene.hasTransparency)
+		{
+			bgfx::setPaletteColor(0, 0.0f, 0.0f, 0.0f, 0.0f);
+			bgfx::setPaletteColor(1, 1.0f, 1.0f, 1.0f, 1.0f);
+			bgfx::setViewClear(kViewRenderT, BGFX_CLEAR_COLOR, 1.0f, 0, 0, 1);
+		}
 
 		const char* shot = getenv("IFC_SHOT");
 		if (shot)
 			bx::strCopy(m_shotPath, sizeof(m_shotPath), shot);
 
 		imguiCreate();
-		m_timeOffset = bx::getHPCounter();
+	}
+
+	// Rebuild the list of contiguous visible draw-item ranges. Called on init and
+	// on every UI toggle -- never per frame.
+	//
+	// A model's draw items are contiguous, so the cull pass can dispatch over the
+	// visible ranges only and a hidden model costs literally nothing: no threads,
+	// no buffer loads. Adjacent visible models merge into one range, so the common
+	// cases (all visible, or a few disciplines switched off) come out as one or a
+	// handful of dispatches rather than 123.
+	void rebuildVisibleRuns()
+	{
+		m_visRuns.clear();
+		for (const ModelInfo& m : m_scene.models)
+		{
+			if (!m.visible || m.itemCount == 0)
+				continue;
+			if (!m_visRuns.empty() && m_visRuns.back().end == m.firstItem)
+				m_visRuns.back().end = m.firstItem + m.itemCount;  // merge with previous
+			else
+				m_visRuns.push_back({ m.firstItem, m.firstItem + m.itemCount });
+		}
 	}
 
 	void createBuffers()
@@ -669,6 +733,8 @@ public:
 		m_drawParamsBuf = bgfx::createIndexBuffer(
 			bgfx::copy(m_scene.drawParams.data(), uint32_t(m_scene.drawParams.size() * sizeof(uint32_t))),
 			BGFX_BUFFER_INDEX32 | BGFX_BUFFER_COMPUTE_READ);
+
+		rebuildVisibleRuns();
 
 		// per-instance world AABB (vec4 pairs) - compute read
 		m_bboxLayout.begin().add(bgfx::Attrib::TexCoord0, 4, bgfx::AttribType::Float).end();
@@ -738,8 +804,15 @@ public:
 		// WBOIT targets are MSAA too.
 		const uint64_t msaaFlags = m_msaa ? BGFX_TEXTURE_RT_MSAA_X4 : BGFX_TEXTURE_NONE;
 		m_colorTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::BGRA8,   tsFlags | msaaFlags);
-		m_accumTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::RGBA16F, tsFlags | msaaFlags);
-		m_revealTex = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::R16F,    tsFlags | msaaFlags);
+		// The WBOIT targets are the expensive pair -- at 1080p with MSAA x4 the
+		// fp16 accum alone is ~66 MB, and both are cleared every frame. Skip them
+		// outright when the scene has no transparent material (e.g. an MEP-only
+		// load); the opaque composite variant never samples them.
+		if (m_scene.hasTransparency)
+		{
+			m_accumTex  = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::RGBA16F, tsFlags | msaaFlags);
+			m_revealTex = bgfx::createTexture2D(bgfx::BackbufferRatio::Equal, false, 1, bgfx::TextureFormat::R16F,    tsFlags | msaaFlags);
+		}
 		// Depth is the awkward one. bgfx rejects an MSAA depth attachment unless
 		// it is RT_WRITE_ONLY or MSAA_SAMPLE ("depth textures do not support MSAA
 		// resolve"). Example 09-hdr uses WRITE_ONLY because it never reads depth;
@@ -758,12 +831,14 @@ public:
 		opaqueAtt[1].init(m_mainDepth, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
 		m_opaqueFb = bgfx::createFrameBuffer(BX_COUNTOF(opaqueAtt), opaqueAtt, false);
 
-		bgfx::Attachment oitAtt[3];
-		oitAtt[0].init(m_accumTex,  bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
-		oitAtt[1].init(m_revealTex, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
-		oitAtt[2].init(m_mainDepth, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);  // shared with opaque
-		m_oitFb = bgfx::createFrameBuffer(BX_COUNTOF(oitAtt), oitAtt, false);
-
+		if (m_scene.hasTransparency)
+		{
+			bgfx::Attachment oitAtt[3];
+			oitAtt[0].init(m_accumTex,  bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
+			oitAtt[1].init(m_revealTex, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);
+			oitAtt[2].init(m_mainDepth, bgfx::Access::Write, 0, 1, 0, BGFX_RESOLVE_NONE);  // shared with opaque
+			m_oitFb = bgfx::createFrameBuffer(BX_COUNTOF(oitAtt), oitAtt, false);
+		}
 	}
 
 	virtual int shutdown() override
@@ -791,6 +866,8 @@ public:
 		// framebuffers first: they were created with destroyTextures=false because
 		// the depth texture is shared between them.
 		if (bgfx::isValid(m_opaqueFb))  bgfx::destroy(m_opaqueFb);
+		// m_oitFb / m_accumTex / m_revealTex are only created for a scene with
+		// transparent material, hence the isValid guards.
 		if (bgfx::isValid(m_oitFb))     bgfx::destroy(m_oitFb);
 		if (bgfx::isValid(m_colorTex))  bgfx::destroy(m_colorTex);
 		if (bgfx::isValid(m_mainDepth)) bgfx::destroy(m_mainDepth);
@@ -799,12 +876,14 @@ public:
 		bgfx::destroy(m_progRender);
 		bgfx::destroy(m_progOit);
 		bgfx::destroy(m_progComposite);
+		bgfx::destroy(m_progCompositeOpaque);
 		bgfx::destroy(m_progDepth);
 		bgfx::destroy(m_progReset);
 		bgfx::destroy(m_progCull);
 		bgfx::destroy(m_progCopyZ);
 		bgfx::destroy(m_progDownscale);
 		bgfx::destroy(u_cullParams);
+		bgfx::destroy(u_cullRange);
 		bgfx::destroy(u_hiZSize);
 		bgfx::destroy(u_screenPixels);
 		bgfx::destroy(u_inputRTSize);
@@ -848,6 +927,8 @@ public:
 		ImGui::Text("Instances: %u", m_numInstances);
 		ImGui::Text("Triangles: %llu", (unsigned long long)m_scene.numTriangles);
 		ImGui::End();
+
+		showModelList();
 
 		imguiEndFrame();
 
@@ -925,12 +1006,21 @@ public:
 			// pass: reset current draw counters (opaque + transparent)
 			bgfx::setBuffer(0, m_count[cur], bgfx::Access::Write);
 			bgfx::dispatch(kViewReset, m_progReset, 1, 1, 1);
-			bgfx::setBuffer(0, m_transpCount, bgfx::Access::Write);
-			bgfx::dispatch(kViewReset, m_progReset, 1, 1, 1);
+			if (m_scene.hasTransparency)
+			{
+				bgfx::setBuffer(0, m_transpCount, bgfx::Access::Write);
+				bgfx::dispatch(kViewReset, m_progReset, 1, 1, 1);
+			}
 			bgfx::setBuffer(0, m_occCount[cur], bgfx::Access::Write);
 			bgfx::dispatch(kViewReset, m_progReset, 1, 1, 1);
 
-			// pass: cull (frustum + Hi-Z occlusion) -> current commands
+			// pass: cull (frustum + Hi-Z occlusion) -> current commands.
+			//
+			// One dispatch per contiguous run of visible models. Hidden models are
+			// not in any run, so they cost zero threads -- the alternative (one
+			// dispatch over all items, testing visibility inside the shader) still
+			// launches a thread and loads draw params for every hidden item.
+			// All runs share the same atomic counters, which were reset above.
 			bgfx::setViewTransform(kViewCull, view, proj);
 			float cullParams[4] = {
 				float(m_numInstances),
@@ -939,20 +1029,27 @@ public:
 				float(m_hizMips - 1)
 			};
 			float hizSize[4] = { float(m_hizW), float(m_hizH), 1.0f / float(m_hizW), 1.0f / float(m_hizH) };
-			bgfx::setUniform(u_cullParams, cullParams);
-			bgfx::setUniform(u_hiZSize, hizSize);
 			float screenPixels[4] = { float(m_width), float(m_height), m_minPixelSize, 0.0f };
-			bgfx::setUniform(u_screenPixels, screenPixels);
-			bgfx::setTexture(0, s_hiZ, m_hizTex);
-			bgfx::setBuffer(1, m_drawParamsBuf,  bgfx::Access::Read);
-			bgfx::setBuffer(2, m_bboxBuf,        bgfx::Access::Read);
-			bgfx::setBuffer(3, m_count[cur],     bgfx::Access::ReadWrite);
-			bgfx::setBuffer(4, m_indirect[cur],  bgfx::Access::Write);
-			bgfx::setBuffer(5, m_transpCount,    bgfx::Access::ReadWrite);
-			bgfx::setBuffer(6, m_transpIndirect, bgfx::Access::Write);
-			bgfx::setBuffer(7, m_occCount[cur],  bgfx::Access::ReadWrite);
-			bgfx::setBuffer(8, m_occIndirect[cur], bgfx::Access::Write);
-			bgfx::dispatch(kViewCull, m_progCull, (m_numInstances + 63) / 64, 1, 1);
+			for (const Range& r : m_visRuns)
+			{
+				// bgfx discards bound state after each dispatch, so everything is
+				// rebound per run.
+				float cullRange[4] = { float(r.begin), float(r.end), 0.0f, 0.0f };
+				bgfx::setUniform(u_cullParams, cullParams);
+				bgfx::setUniform(u_cullRange, cullRange);
+				bgfx::setUniform(u_hiZSize, hizSize);
+				bgfx::setUniform(u_screenPixels, screenPixels);
+				bgfx::setTexture(0, s_hiZ, m_hizTex);
+				bgfx::setBuffer(1, m_drawParamsBuf,  bgfx::Access::Read);
+				bgfx::setBuffer(2, m_bboxBuf,        bgfx::Access::Read);
+				bgfx::setBuffer(3, m_count[cur],     bgfx::Access::ReadWrite);
+				bgfx::setBuffer(4, m_indirect[cur],  bgfx::Access::Write);
+				bgfx::setBuffer(5, m_transpCount,    bgfx::Access::ReadWrite);
+				bgfx::setBuffer(6, m_transpIndirect, bgfx::Access::Write);
+				bgfx::setBuffer(7, m_occCount[cur],  bgfx::Access::ReadWrite);
+				bgfx::setBuffer(8, m_occIndirect[cur], bgfx::Access::Write);
+				bgfx::dispatch(kViewCull, m_progCull, (r.end - r.begin + 63) / 64, 1, 1);
+			}
 
 			// pass: render opaque visible set via indirect draw with GPU draw count.
 			// Targets the offscreen colour+depth so the OIT and composite passes
@@ -978,22 +1075,28 @@ public:
 			// Depth-tests against the opaque depth but never writes it. Both blends
 			// are commutative, so the GPU-driven arbitrary draw order is harmless —
 			// this is what removes the flicker, with no sorting at all.
-			bgfx::setViewFrameBuffer(kViewRenderT, m_oitFb);
-			bgfx::setViewTransform(kViewRenderT, view, proj);
-			bgfx::setViewRect(kViewRenderT, 0, 0, uint16_t(m_width), uint16_t(m_height));
-			bgfx::setVertexBuffer(0, m_vbh);
-			bgfx::setIndexBuffer(m_ibh);
-			bgfx::setInstanceDataBuffer(m_instanceVbh, 0, m_numInstances);
-			bgfx::setState(0
-				| BGFX_STATE_WRITE_RGB
-				| BGFX_STATE_WRITE_A
-				| BGFX_STATE_DEPTH_TEST_GREATER  // reverse-Z
-				| BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE)  // RT0 accum: additive
-				| BGFX_STATE_BLEND_INDEPENDENT
-				, 0
-				| BGFX_STATE_BLEND_FUNC_RT_1(BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_INV_SRC_COLOR)  // RT1 reveal: dst *= (1-a)
-				);
-			bgfx::submit(kViewRenderT, m_progOit, m_transpIndirect, 0, m_transpCount, 0, uint32_t(m_numInstances));
+			//
+			// Skipped entirely for a scene with no transparent material: with no
+			// draw submitted, bgfx drops the view and its clear too.
+			if (m_scene.hasTransparency)
+			{
+				bgfx::setViewFrameBuffer(kViewRenderT, m_oitFb);
+				bgfx::setViewTransform(kViewRenderT, view, proj);
+				bgfx::setViewRect(kViewRenderT, 0, 0, uint16_t(m_width), uint16_t(m_height));
+				bgfx::setVertexBuffer(0, m_vbh);
+				bgfx::setIndexBuffer(m_ibh);
+				bgfx::setInstanceDataBuffer(m_instanceVbh, 0, m_numInstances);
+				bgfx::setState(0
+					| BGFX_STATE_WRITE_RGB
+					| BGFX_STATE_WRITE_A
+					| BGFX_STATE_DEPTH_TEST_GREATER  // reverse-Z
+					| BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE, BGFX_STATE_BLEND_ONE)  // RT0 accum: additive
+					| BGFX_STATE_BLEND_INDEPENDENT
+					, 0
+					| BGFX_STATE_BLEND_FUNC_RT_1(BGFX_STATE_BLEND_ZERO, BGFX_STATE_BLEND_INV_SRC_COLOR)  // RT1 reveal: dst *= (1-a)
+					);
+				bgfx::submit(kViewRenderT, m_progOit, m_transpIndirect, 0, m_transpCount, 0, uint32_t(m_numInstances));
+			}
 
 			// pass: composite opaque + resolved transparency -> backbuffer
 			{
@@ -1004,8 +1107,11 @@ public:
 				bgfx::setViewRect(kViewComposite, 0, 0, uint16_t(m_width), uint16_t(m_height));
 				bgfx::setViewTransform(kViewComposite, NULL, ortho);
 				bgfx::setTexture(0, s_opaqueColor, m_colorTex);
-				bgfx::setTexture(1, s_accum,       m_accumTex);
-				bgfx::setTexture(2, s_reveal,      m_revealTex);
+				if (m_scene.hasTransparency)
+				{
+					bgfx::setTexture(1, s_accum,  m_accumTex);
+					bgfx::setTexture(2, s_reveal, m_revealTex);
+				}
 				bgfx::setTexture(3, s_depth,       m_mainDepth);
 				// EDL: strength, radius (px), max darken. Defaults from the
 				// bim-viewer; max darken well below 1 keeps edges a soft
@@ -1017,7 +1123,10 @@ public:
 				bgfx::setUniform(u_edlColor, edlColor);
 				bgfx::setState(BGFX_STATE_WRITE_RGB);
 				screenSpaceQuad(bgfx::getCaps()->originBottomLeft);
-				bgfx::submit(kViewComposite, m_progComposite);
+				bgfx::submit(kViewComposite, m_scene.hasTransparency
+					? m_progComposite
+					: m_progCompositeOpaque
+					);
 			}
 
 			m_pingpong = cur;
@@ -1034,6 +1143,93 @@ public:
 
 		bgfx::frame();
 		return true;
+	}
+
+	// Per-model visibility list. Toggling only rewrites the small visibility
+	// buffer; the cull shader drops hidden models before any culling work, so a
+	// hidden model costs one buffer load per draw item and no draw at all.
+	void showModelList()
+	{
+		if (m_scene.models.empty())
+			return;
+
+		ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_FirstUseEver);
+		ImGui::SetNextWindowSize(ImVec2(m_width / 3.5f, m_height * 0.6f), ImGuiCond_FirstUseEver);
+		ImGui::Begin("Models", NULL, 0);
+
+		bool changed = false;
+
+		uint32_t visibleModels = 0, visibleItems = 0;
+		size_t   visibleTris = 0;
+		for (const ModelInfo& m : m_scene.models)
+		{
+			if (m.visible)
+			{
+				visibleModels++;
+				visibleItems += m.itemCount;
+				visibleTris  += m.triangles;
+			}
+		}
+
+		if (ImGui::Button("All"))
+		{
+			for (ModelInfo& m : m_scene.models) m.visible = true;
+			changed = true;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("None"))
+		{
+			for (ModelInfo& m : m_scene.models) m.visible = false;
+			changed = true;
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Invert"))
+		{
+			for (ModelInfo& m : m_scene.models) m.visible = !m.visible;
+			changed = true;
+		}
+
+		ImGui::Text("%u / %u models, %u items, %.1f M tris"
+			, visibleModels
+			, uint32_t(m_scene.models.size())
+			, visibleItems
+			, double(visibleTris) / 1e6
+			);
+		// Cull threads track visible items only, not the whole scene -- this line
+		// is the point of the range dispatch, so show it.
+		ImGui::Text("Cull: %u dispatch(es), %u threads (of %u)"
+			, uint32_t(m_visRuns.size())
+			, visibleItems
+			, m_numInstances
+			);
+		ImGui::Separator();
+
+		ImGui::BeginChild("modellist", ImVec2(0.0f, 0.0f), false);
+		for (size_t i = 0; i < m_scene.models.size(); i++)
+		{
+			ModelInfo& m = m_scene.models[i];
+			// PushID: names are not guaranteed unique across directories, and
+			// duplicate labels would otherwise share one ImGui id.
+			ImGui::PushID(int(i) );
+			if (ImGui::Checkbox("##vis", &m.visible) )
+				changed = true;
+			ImGui::SameLine();
+			ImGui::Text("%s", m.name.c_str() );
+			if (ImGui::IsItemHovered() )
+			{
+				ImGui::SetTooltip("%s\n%u draw items, %.2f M triangles"
+					, m.name.c_str()
+					, m.itemCount
+					, double(m.triangles) / 1e6
+					);
+			}
+			ImGui::PopID();
+		}
+		ImGui::EndChild();
+		ImGui::End();
+
+		if (changed)
+			rebuildVisibleRuns();
 	}
 
 	void updateCamera()
@@ -1108,7 +1304,6 @@ public:
 
 	entry::MouseState m_mouseState;
 	uint32_t m_width = 0, m_height = 0, m_debug = 0, m_reset = 0;
-	int64_t  m_timeOffset = 0;
 
 	Scene m_scene;
 	uint32_t m_numInstances = 0;
@@ -1120,6 +1315,11 @@ public:
 	bgfx::VertexBufferHandle       m_instanceVbh = BGFX_INVALID_HANDLE;
 	bgfx::IndexBufferHandle        m_drawParamsBuf = BGFX_INVALID_HANDLE;
 	bgfx::VertexBufferHandle       m_bboxBuf = BGFX_INVALID_HANDLE;
+
+	// Contiguous [begin,end) draw-item ranges of the currently visible models.
+	// Rebuilt only on a UI toggle; the cull pass dispatches one per range.
+	struct Range { uint32_t begin, end; };
+	std::vector<Range> m_visRuns;
 	// ping-pong indirect commands + draw counts (temporal occlusion)
 	bgfx::IndexBufferHandle    m_count[2]    = { BGFX_INVALID_HANDLE, BGFX_INVALID_HANDLE };
 	bgfx::IndirectBufferHandle m_indirect[2] = { BGFX_INVALID_HANDLE, BGFX_INVALID_HANDLE };
@@ -1148,12 +1348,14 @@ public:
 	bgfx::ProgramHandle m_progRender    = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progOit       = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progComposite = BGFX_INVALID_HANDLE;
+	bgfx::ProgramHandle m_progCompositeOpaque = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progDepth     = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progReset     = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progCull      = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progCopyZ     = BGFX_INVALID_HANDLE;
 	bgfx::ProgramHandle m_progDownscale = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle u_cullParams        = BGFX_INVALID_HANDLE;
+	bgfx::UniformHandle u_cullRange         = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle u_hiZSize           = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle u_screenPixels      = BGFX_INVALID_HANDLE;
 	bgfx::UniformHandle u_inputRTSize       = BGFX_INVALID_HANDLE;

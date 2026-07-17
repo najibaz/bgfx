@@ -9,7 +9,15 @@
  * Occlusion uses a hierarchical-Z pyramid built from the previous frame's
  * visible set (temporal occluders). Adapted from example 37 (cs_gdr_occlude_props).
  *
- * u_cullParams.x = instance count
+ * Dispatched once per CONTIGUOUS RANGE of visible draw items, not once over the
+ * whole scene. A model's items are contiguous (one .db is appended in one go),
+ * so hiding a model removes its range from the dispatch list entirely and it
+ * costs zero threads -- checking visibility inside the shader would still pay a
+ * thread and a buffer load per hidden item.
+ *
+ * u_cullRange.x  = first draw item of this dispatch's range
+ * u_cullRange.y  = one past the last draw item of the range
+ * u_cullParams.x = total draw item count (informational; the range bounds the work)
  * u_cullParams.y = frustum cull enable (0/1)
  * u_cullParams.z = occlusion cull enable (0/1)
  * u_cullParams.w = Hi-Z max mip INDEX (the C++ passes m_hizMips - 1, not the count)
@@ -20,7 +28,7 @@
 #include "bgfx_compute.sh"
 
 SAMPLER2D(s_hiZ, 0);
-BUFFER_RO(instanceDrawParams, uvec4, 1);  // indexCount, firstIndex, baseVertex, transparentFlag
+BUFFER_RO(instanceDrawParams, uvec4, 1);  // indexCount, firstIndex, baseVertex, flags
 BUFFER_RO(instanceBBox,       vec4, 2);   // [2i]=min.xyz, [2i+1]=max.xyz (world space)
 BUFFER_RW(opaqueCount,        uint, 3);   // opaque atomic counter
 BUFFER_WO(opaqueIndirect,     uvec4, 4);  // opaque DrawIndexedIndirect commands
@@ -30,15 +38,20 @@ BUFFER_RW(occCount,           uint, 7);   // occluder atomic counter
 BUFFER_WO(occIndirect,        uvec4, 8);  // occluder commands (Hi-Z depth pass)
 
 uniform vec4 u_cullParams;
+uniform vec4 u_cullRange;     // x = first draw item of this range, y = one past last
 uniform vec4 u_hiZSize;
 uniform vec4 u_screenPixels;  // xy = screen size (px), z = min projected size (px) to keep
 
 NUM_THREADS(64, 1, 1)
 void main()
 {
-	uint idx = gl_GlobalInvocationID.x;
-	if (idx >= uint(u_cullParams.x))
+	// Index within this range's slice of the scene. Only visible models are
+	// dispatched, so there is no per-item visibility test here at all.
+	uint idx = uint(u_cullRange.x) + gl_GlobalInvocationID.x;
+	if (idx >= uint(u_cullRange.y) )
 		return;
+
+	uvec4 dp = instanceDrawParams[idx];
 
 	vec3 bmin = instanceBBox[2u * idx].xyz;
 	vec3 bmax = instanceBBox[2u * idx + 1u].xyz;
@@ -164,7 +177,6 @@ void main()
 
 	if (visible)
 	{
-		uvec4 dp = instanceDrawParams[idx];
 		uint slot;
 		bool transparent = (dp.w & 1u) != 0u;
 		if (!transparent)

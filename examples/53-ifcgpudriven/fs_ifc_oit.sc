@@ -35,14 +35,20 @@ void main()
 
 	float a = v_color.a;
 
-	// McGuire weight function tuned for NDC depth in [0,1]: near fragments
-	// dominate, far ones fade, clamped to [1e-2, 3e3] to stay in fp16 range.
+	// McGuire weight function, adapted for REVERSE-Z. Near fragments must
+	// dominate; the published form (1.0 - z*0.9) assumes standard Z, and with
+	// near = 1 here it weights the FAR plane 1000:1 over the near one. The depth
+	// term has to rise with z instead.
+	//
+	// The published 1e8 scale is also wrong against this clamp: it puts every
+	// fragment of alpha >~ 0.03 on the 3e3 ceiling at BOTH ends of the depth
+	// range, so the depth term cancels and WBOIT silently degrades to an
+	// unweighted average. 1e4 keeps near pinned at the ceiling while letting far
+	// fragments fall away, which is the whole point of the weighting.
 	float z = gl_FragCoord.z;
-	float w = clamp(
-		  pow(min(1.0, a * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - z * 0.9, 3.0)
-		, 1e-2
-		, 3e3
-		);
+	float alphaWeight = pow(min(1.0, a * 10.0) + 0.01, 3.0);
+	float depthWeight = pow(0.1 + 0.9 * z, 3.0);
+	float w = clamp(alphaWeight * 1e4 * depthWeight, 1e-2, 3e3);
 
 	gl_FragData[0] = vec4(color * a, a) * w;  // accum  (blend ONE, ONE)
 	gl_FragData[1] = vec4_splat(a);           // reveal (blend ZERO, INV_SRC_COLOR)
