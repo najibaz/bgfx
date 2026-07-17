@@ -613,7 +613,19 @@ public:
 			m_scene.hasTransparency ? "yes" : "none",
 			m_scene.hasTransparency ? "active" : "skipped -- no accum/reveal targets");
 
+		// createBuffers uploads and then releases each CPU-side vector, so report
+		// the mirror size before it goes.
+		const double cpuMirrorMB =
+			( double(m_scene.vertices.size()   * sizeof(int16_t))
+			+ double(m_scene.indices.size()    * sizeof(uint32_t))
+			+ double(m_scene.instances.size()  * sizeof(InstanceRender))
+			+ double(m_scene.drawParams.size() * sizeof(uint32_t))
+			+ double(m_scene.bbox.size()       * sizeof(float))
+			) / 1e6;
+
 		createBuffers();
+
+		bx::debugPrintf("CPU scene mirror released after upload: %.0f MB\n", cpuMirrorMB);
 
 		// programs
 		m_progRender    = loadProgram("vs_ifc", "fs_ifc");
@@ -705,6 +717,23 @@ public:
 		}
 	}
 
+	// bgfx::copy takes its own copy of the data, so the source vector is dead the
+	// moment the buffer is created -- but it is a member and would otherwise live
+	// for the whole session. On a large load that is over a gigabyte of system RAM
+	// mirroring a scene that is already in VRAM.
+	//
+	// Freed here rather than after createBuffers() so the *peak* drops too: each
+	// vector dies as soon as its bgfx-side copy exists, instead of every vector
+	// and every copy being live at once.
+	//
+	// swap with a temporary, not clear() or resize(0): those keep the capacity,
+	// which is the whole point of the exercise.
+	template<typename T>
+	static void releaseVector(std::vector<T>& v)
+	{
+		std::vector<T>().swap(v);
+	}
+
 	void createBuffers()
 	{
 		if (m_numInstances == 0)
@@ -713,9 +742,12 @@ public:
 		m_vbh = bgfx::createVertexBuffer(
 			bgfx::copy(m_scene.vertices.data(), uint32_t(m_scene.vertices.size() * sizeof(int16_t))),
 			PosVertex::ms_layout);
+		releaseVector(m_scene.vertices);
+
 		m_ibh = bgfx::createIndexBuffer(
 			bgfx::copy(m_scene.indices.data(), uint32_t(m_scene.indices.size() * sizeof(uint32_t))),
 			BGFX_BUFFER_INDEX32);
+		releaseVector(m_scene.indices);
 
 		// instance render stream: 5 x vec4 (mat4 + color)
 		m_instanceLayout.begin()
@@ -728,11 +760,13 @@ public:
 		m_instanceVbh = bgfx::createVertexBuffer(
 			bgfx::copy(m_scene.instances.data(), uint32_t(m_scene.instances.size() * sizeof(InstanceRender))),
 			m_instanceLayout);
+		releaseVector(m_scene.instances);  // m_numInstances already captured
 
 		// per-instance draw params (uvec4) - compute read
 		m_drawParamsBuf = bgfx::createIndexBuffer(
 			bgfx::copy(m_scene.drawParams.data(), uint32_t(m_scene.drawParams.size() * sizeof(uint32_t))),
 			BGFX_BUFFER_INDEX32 | BGFX_BUFFER_COMPUTE_READ);
+		releaseVector(m_scene.drawParams);
 
 		rebuildVisibleRuns();
 
@@ -741,6 +775,7 @@ public:
 		m_bboxBuf = bgfx::createVertexBuffer(
 			bgfx::copy(m_scene.bbox.data(), uint32_t(m_scene.bbox.size() * sizeof(float))),
 			m_bboxLayout, BGFX_BUFFER_COMPUTE_READ);
+		releaseVector(m_scene.bbox);
 
 		// ping-pong draw counters + indirect command buffers.
 		// The counter must be a static IndexBufferHandle to serve as submit()'s
