@@ -302,6 +302,8 @@ namespace bgfx
 	static constexpr uint32_t kColorWait     = 0xff'8b'94'ff;
 
 	extern InternalData g_internalData;
+	extern VulkanInternals g_vulkanInternals;   // LOCAL PATCH, see bgfx.h
+	extern VulkanExternal  g_vulkanExternal;    // LOCAL PATCH, see bgfx.h
 	extern PlatformData g_platformData;
 	extern bool g_platformDataChangedSinceReset;
 	extern void isFrameBufferValid(uint8_t _num, const Attachment* _attachment, bx::Error* _err);

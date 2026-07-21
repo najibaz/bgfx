@@ -399,6 +399,12 @@ namespace bgfx
 	static Context* s_ctx = NULL;
 	static bool s_renderFrameCalled = false;
 	InternalData g_internalData;
+	// LOCAL PATCH: see VulkanInternals in bgfx.h. Populated by the Vulkan
+	// backend, zero everywhere else.
+	VulkanInternals g_vulkanInternals;
+	// LOCAL PATCH: see VulkanExternal in bgfx.h. Set by the application before
+	// init; read by the Vulkan backend during device setup.
+	VulkanExternal  g_vulkanExternal;
 	PlatformData g_platformData;
 	bool g_platformDataChangedSinceReset = false;
 
@@ -463,6 +469,18 @@ namespace bgfx
 	const InternalData* getInternalData()
 	{
 		return &g_internalData;
+	}
+
+	// LOCAL PATCH: see VulkanInternals in bgfx.h.
+	const VulkanInternals* getVulkanInternals()
+	{
+		return &g_vulkanInternals;
+	}
+
+	// LOCAL PATCH: see VulkanExternal in bgfx.h.
+	void setVulkanExternal(const VulkanExternal& _external)
+	{
+		bx::memCopy(&g_vulkanExternal, &_external, sizeof(VulkanExternal) );
 	}
 
 	uintptr_t overrideInternal(TextureHandle _handle, uintptr_t _ptr, uint16_t _layerIndex)
@@ -2548,6 +2566,9 @@ namespace bgfx
 #endif // BGFX_CONFIG_MULTITHREADED
 
 		bx::memSet(&g_internalData, 0, sizeof(InternalData) );
+		// LOCAL PATCH: the Vulkan handles die with the device; leaving them set
+		// would hand a caller dangling objects after shutdown.
+		bx::memSet(&g_vulkanInternals, 0, sizeof(VulkanInternals) );
 		s_ctx = NULL;
 
 		m_submit->destroy();

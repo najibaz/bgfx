@@ -628,6 +628,68 @@ namespace bgfx
 		void* context;    //!< GL context, or D3D device.
 	};
 
+	/// Vulkan objects bgfx created, for interop with an API that must be handed
+	/// the SAME device - OpenXR being the motivating case.
+	///
+	/// LOCAL PATCH, not upstream bgfx. InternalData::context publishes only the
+	/// VkDevice, and PlatformData accepts only a device as input, so the instance
+	/// and physical device bgfx selected are otherwise unreachable.
+	/// XrGraphicsBindingVulkanKHR requires all five of these, so without this a
+	/// session cannot be created at all - it is not that bgfx might choose a
+	/// different GPU, it is that there is no way to name the GPU to the runtime.
+	///
+	/// D3D12 needs no equivalent: PlatformData accepts both an external device
+	/// and an external command queue, so the caller already owns those handles.
+	///
+	/// All fields are zero unless the active renderer is Vulkan.
+	///
+	struct VulkanInternals
+	{
+		void*    instance;         //!< VkInstance
+		void*    physicalDevice;   //!< VkPhysicalDevice
+		void*    device;           //!< VkDevice, same value as InternalData::context
+		void*    queue;            //!< VkQueue used for graphics and compute
+		uint32_t queueFamilyIndex; //!< Family of `queue`
+		uint32_t queueIndex;       //!< Index within the family; bgfx always uses 0
+	};
+
+	/// Returns the Vulkan objects bgfx created. All fields are zero on other
+	/// renderers. See `VulkanInternals`. LOCAL PATCH, not upstream bgfx.
+	///
+	const VulkanInternals* getVulkanInternals();
+
+	/// Vulkan objects created by someone else, for bgfx to adopt instead of
+	/// creating its own.
+	///
+	/// LOCAL PATCH, not upstream bgfx. PlatformData::context already lets bgfx
+	/// adopt a VkDevice, but it still creates its own VkInstance and selects its
+	/// own physical device first, so the device it adopts belongs to a different
+	/// instance than the one it uses. That is unusable for OpenXR.
+	///
+	/// The motivating case: a compositor needs a device created with extensions
+	/// bgfx does not enable - VK_KHR_external_memory_win32, VK_KHR_timeline_
+	/// semaphore and friends, seven of them for SteamVR. Rather than teach bgfx
+	/// a list that differs per runtime and rots as runtimes change, let the
+	/// runtime build the instance and device (xrCreateVulkanInstanceKHR /
+	/// xrCreateVulkanDeviceKHR) and have bgfx adopt them whole.
+	///
+	/// Set before `bgfx::init`. Any field left NULL means "create this one
+	/// normally", so passing only a device behaves exactly as PlatformData did.
+	///
+	struct VulkanExternal
+	{
+		void*    instance;         //!< VkInstance
+		void*    physicalDevice;   //!< VkPhysicalDevice, must belong to `instance`
+		void*    device;           //!< VkDevice, must belong to `physicalDevice`
+		uint32_t queueFamilyIndex; //!< Family the device was created with
+		uint32_t queueIndex;       //!< Index within that family
+	};
+
+	/// Hands bgfx pre-created Vulkan objects. Call before `bgfx::init`.
+	/// See `VulkanExternal`. LOCAL PATCH, not upstream bgfx.
+	///
+	void setVulkanExternal(const VulkanExternal& _external);
+
 	/// Platform data.
 	///
 	/// @attention C99's equivalent binding is `bgfx_platform_data_t`.

@@ -1227,6 +1227,7 @@ VK_IMPORT_DEVICE
 			, m_memoryLru()
 			, m_device(NULL)
 			, m_externalDevice(NULL)
+			, m_externalInstance(false)   // LOCAL PATCH
 			, m_renderDocDll(NULL)
 			, m_vulkan1Dll(NULL)
 			, m_maxAnisotropy(1.0f)
@@ -1454,11 +1455,25 @@ VK_IMPORT
 					BX_UNUSED(s_allocationCb);
 				}
 
-				result = vkCreateInstance(
-					  &ici
-					, m_allocatorCb
-					, &m_instance
-					);
+				// LOCAL PATCH: adopt an externally created instance. See
+				// VulkanExternal in bgfx.h - a compositor's instance carries
+				// extensions bgfx does not enable, and bgfx creating its own
+				// would leave the adopted device belonging to a different one.
+				if (NULL != g_vulkanExternal.instance)
+				{
+					m_instance = (VkInstance)g_vulkanExternal.instance;
+					m_externalInstance = true;
+					BX_TRACE("Using external VkInstance.");
+					result = VK_SUCCESS;
+				}
+				else
+				{
+					result = vkCreateInstance(
+						  &ici
+						, m_allocatorCb
+						, &m_instance
+						);
+				}
 
 				if (VK_SUCCESS != result)
 				{
@@ -1642,6 +1657,40 @@ VK_IMPORT_INSTANCE
 						? 0
 						: fallbackPhysicalDeviceIdx
 						;
+				}
+
+				// LOCAL PATCH: override bgfx's choice with the physical device
+				// the caller was told to use. The runtime names it
+				// (xrGetVulkanGraphicsDeviceKHR) and bgfx's heuristic has no way
+				// to know about that constraint.
+				//
+				// Overriding AFTER selection rather than skipping selection: the
+				// enumeration also fills physicalDeviceExtensions, and everything
+				// below - features, extensions, queue families - is queried
+				// against m_physicalDevice and stays correct. Matching by handle
+				// keeps the extension table aligned with the device.
+				if (NULL != g_vulkanExternal.physicalDevice)
+				{
+					const VkPhysicalDevice wanted = (VkPhysicalDevice)g_vulkanExternal.physicalDevice;
+					uint32_t wantedIdx = UINT32_MAX;
+
+					for (uint32_t ii = 0; ii < numPhysicalDevices; ++ii)
+					{
+						if (physicalDevices[ii] == wanted)
+						{
+							wantedIdx = ii;
+							break;
+						}
+					}
+
+					if (UINT32_MAX == wantedIdx)
+					{
+						BX_TRACE("Init error: external VkPhysicalDevice is not one this VkInstance enumerates.");
+						goto error;
+					}
+
+					physicalDeviceIdx = wantedIdx;
+					BX_TRACE("Using external VkPhysicalDevice (index %d).", physicalDeviceIdx);
 				}
 
 				m_physicalDevice = physicalDevices[physicalDeviceIdx];
@@ -1991,6 +2040,15 @@ VK_IMPORT_INSTANCE
 
 				bx::free(g_allocator, queueFamilyPropertices);
 
+				// LOCAL PATCH: an externally created device was created with a
+				// specific queue family, and the queue we later fetch must come
+				// from that same family or vkGetDeviceQueue is undefined.
+				if (NULL != g_vulkanExternal.device)
+				{
+					m_globalQueueFamily = g_vulkanExternal.queueFamilyIndex;
+					BX_TRACE("Using external queue family %d.", m_globalQueueFamily);
+				}
+
 				if (UINT32_MAX == m_globalQueueFamily)
 				{
 					BX_TRACE("Init error: Unable to find combined graphics and compute queue.");
@@ -1998,7 +2056,17 @@ VK_IMPORT_INSTANCE
 				}
 			}
 
-			if (NULL != g_platformData.context)
+			// LOCAL PATCH: VulkanExternal::device takes precedence over
+			// PlatformData::context. They mean the same thing, but the former
+			// arrives with a matching instance and physical device, and mixing
+			// the two sources is how a device ends up paired with the wrong
+			// instance.
+			if (NULL != g_vulkanExternal.device)
+			{
+				m_device =
+					m_externalDevice = (VkDevice)g_vulkanExternal.device;
+			}
+			else if (NULL != g_platformData.context)
 			{
 				m_device =
 					m_externalDevice = (VkDevice)g_platformData.context;
@@ -2332,6 +2400,17 @@ VK_IMPORT_DEVICE
 			}
 
 			g_internalData.context = m_device;
+
+			// LOCAL PATCH: publish the objects OpenXR needs. See VulkanInternals
+			// in bgfx.h - XrGraphicsBindingVulkanKHR requires all five, and
+			// InternalData::context carries only the device.
+			g_vulkanInternals.instance         = (void*)m_instance;
+			g_vulkanInternals.physicalDevice   = (void*)m_physicalDevice;
+			g_vulkanInternals.device           = (void*)m_device;
+			g_vulkanInternals.queue            = (void*)m_globalQueue;
+			g_vulkanInternals.queueFamilyIndex = m_globalQueueFamily;
+			g_vulkanInternals.queueIndex       = 0;   // vkGetDeviceQueue(..., 0, ...) above
+
 			return true;
 
 		error:
@@ -2368,7 +2447,11 @@ VK_IMPORT_DEVICE
 				[[fallthrough]];
 
 			case ErrorState::DeviceCreated:
-				vkDestroyDevice(m_device, m_allocatorCb);
+				// LOCAL PATCH: same ownership rule as the normal shutdown path.
+				if (NULL == m_externalDevice)
+				{
+					vkDestroyDevice(m_device, m_allocatorCb);
+				}
 				[[fallthrough]];
 
 			case ErrorState::InstanceCreated:
@@ -2377,7 +2460,12 @@ VK_IMPORT_DEVICE
 					vkDestroyDebugReportCallbackEXT(m_instance, m_debugReportCallback, m_allocatorCb);
 				}
 
-				vkDestroyInstance(m_instance, m_allocatorCb);
+				// LOCAL PATCH: an adopted instance belongs to the caller even
+				// when init fails.
+				if (!m_externalInstance)
+				{
+					vkDestroyInstance(m_instance, m_allocatorCb);
+				}
 				[[fallthrough]];
 
 			case ErrorState::LoadedVulkan1:
@@ -2478,7 +2566,14 @@ VK_IMPORT_DEVICE
 				vkDestroyDebugReportCallbackEXT(m_instance, m_debugReportCallback, m_allocatorCb);
 			}
 
-			vkDestroyInstance(m_instance, m_allocatorCb);
+			// LOCAL PATCH: do not destroy an instance bgfx did not create. The
+			// owner - the OpenXR session, here - outlives bgfx shutdown, and
+			// destroying it from under them would take the runtime with it.
+			if (!m_externalInstance)
+			{
+				vkDestroyInstance(m_instance, m_allocatorCb);
+			}
+			m_instance = VK_NULL_HANDLE;
 
 			bx::dlclose(m_vulkan1Dll);
 			m_vulkan1Dll  = NULL;
@@ -4960,6 +5055,7 @@ VK_IMPORT_DEVICE
 
 		VkDevice m_device;
 		VkDevice m_externalDevice;
+		bool     m_externalInstance;   // LOCAL PATCH: do not destroy what we did not create
 		uint32_t m_globalQueueFamily;
 		VkQueue  m_globalQueue;
 		uint32_t m_videoDecodeQueueFamily;
