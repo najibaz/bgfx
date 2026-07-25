@@ -15,6 +15,7 @@
 #include "common.h"
 #include "bgfx_utils.h"
 #include "imgui/imgui.h"
+#include <debugdraw/debugdraw.h>
 
 #include <bx/allocator.h>
 #include <bx/math.h>
@@ -693,6 +694,7 @@ public:
 			bx::strCopy(m_shotPath, sizeof(m_shotPath), shot);
 
 		imguiCreate();
+		ddInit();  // frozen-frustum debug wireframe
 	}
 
 	// Rebuild the list of contiguous visible draw-item ranges. Called on init and
@@ -878,6 +880,7 @@ public:
 
 	virtual int shutdown() override
 	{
+		ddShutdown();
 		imguiDestroy();
 		if (bgfx::isValid(m_vbh))          bgfx::destroy(m_vbh);
 		if (bgfx::isValid(m_ibh))          bgfx::destroy(m_ibh);
@@ -953,6 +956,11 @@ public:
 		ImGui::Checkbox("Frustum cull", &m_frustumCull);
 		ImGui::Checkbox("Occlusion cull (Hi-Z)", &m_occlusionCull);
 		ImGui::SliderFloat("Min pixel size", &m_minPixelSize, 0.0f, 8.0f);
+		// Freeze the cull's camera and fly the live one out: what remains is
+		// exactly what the frozen camera kept.
+		ImGui::Checkbox("Freeze cull (debug camera)", &m_freezeCull);
+		if (m_freezeCull)
+			ImGui::TextWrapped("Culling frozen. Orbit freely - only geometry the frozen frustum kept is drawn.");
 		ImGui::Separator();
 		ImGui::Text("Edge darkening (EDL)");
 		ImGui::SliderFloat("Strength", &m_edlStrength, 0.0f, 2.0f);
@@ -1002,6 +1010,29 @@ public:
 		bx::mtxProj(proj, 60.0f, float(m_width) / float(m_height), camFar, camNear
 			, bgfx::getCaps()->homogeneousDepth);
 
+		// FROZEN-FRUSTUM DEBUG VIEW.
+		//
+		// The cull's frustum comes solely from the view transform on its dispatch
+		// view (u_viewProj). So a second camera is unnecessary: snapshot the
+		// matrices, keep feeding the frozen pair to the cull while the live orbit
+		// camera drives the render passes, and the existing camera *becomes* the
+		// debug camera. Fly out and the surviving set hangs in space -- everything
+		// the frozen camera rejected is simply absent, which turns over-culling
+		// from an inference into something you can look at.
+		//
+		// The Hi-Z depth pass must freeze too: it builds the pyramid the cull
+		// samples, so a live camera there would test against a pyramid from a
+		// different viewpoint.
+		if (m_freezeCull && !m_freezeCullPrev)
+		{
+			bx::memCopy(m_frozenView, view, sizeof(m_frozenView));
+			bx::memCopy(m_frozenProj, proj, sizeof(m_frozenProj));
+		}
+		m_freezeCullPrev = m_freezeCull;
+
+		const float* cullView = m_freezeCull ? m_frozenView : view;
+		const float* cullProj = m_freezeCull ? m_frozenProj : proj;
+
 		if (m_numInstances > 0)
 		{
 			const int prev = m_pingpong;
@@ -1010,7 +1041,8 @@ public:
 			// pass 0: render previous-frame visible set to depth (temporal occluders)
 			bgfx::setViewFrameBuffer(kViewDepth, m_depthFb);
 			bgfx::setViewRect(kViewDepth, 0, 0, uint16_t(m_hizW), uint16_t(m_hizH));
-			bgfx::setViewTransform(kViewDepth, view, proj);
+			// Frozen with the cull: this depth becomes the Hi-Z the cull samples.
+			bgfx::setViewTransform(kViewDepth, cullView, cullProj);
 			bgfx::setVertexBuffer(0, m_vbh);
 			bgfx::setIndexBuffer(m_ibh);
 			bgfx::setInstanceDataBuffer(m_instanceVbh, 0, m_numInstances);
@@ -1056,7 +1088,10 @@ public:
 			// dispatch over all items, testing visibility inside the shader) still
 			// launches a thread and loads draw params for every hidden item.
 			// All runs share the same atomic counters, which were reset above.
-			bgfx::setViewTransform(kViewCull, view, proj);
+			//
+			// cullView/cullProj, not view/proj: this is the one place the cull's
+			// frustum is defined, so freezing it here is the whole debug feature.
+			bgfx::setViewTransform(kViewCull, cullView, cullProj);
 			float cullParams[4] = {
 				float(m_numInstances),
 				m_frustumCull   ? 1.0f : 0.0f,
@@ -1105,6 +1140,24 @@ public:
 				| BGFX_STATE_MSAA
 				);
 			bgfx::submit(kViewRender, m_progRender, m_indirect[cur], 0, m_count[cur], 0, uint32_t(m_numInstances));
+
+			// Frozen frustum wireframe, into the opaque target so the composite
+			// carries it through.
+			if (m_freezeCull)
+			{
+				float frozenViewProj[16];
+				bx::mtxMul(frozenViewProj, m_frozenView, m_frozenProj);
+
+				DebugDrawEncoder dde;
+				// depthTestLess = FALSE. It defaults to true, which selects
+				// DEPTH_TEST_LESS -- backwards under reverse-Z, where the wireframe
+				// would then fail against everything and never appear.
+				dde.begin(kViewRender, false);
+				dde.setWireframe(true);
+				dde.setColor(0xff00ff00);
+				dde.drawFrustum(frozenViewProj);
+				dde.end();
+			}
 
 			// pass: accumulate the transparent visible set (weighted-blended OIT).
 			// Depth-tests against the opaque depth but never writes it. Both blends
@@ -1421,6 +1474,12 @@ public:
 	bool  m_dragging = false;
 	int32_t m_prevMx = 0, m_prevMy = 0, m_prevMz = 0;
 	bool  m_frustumCull = true;
+	// Frozen-frustum debug view: the cull keeps using the snapshot while the live
+	// camera flies. m_freezeCullPrev gives the rising edge that takes the snapshot.
+	bool  m_freezeCull = false;
+	bool  m_freezeCullPrev = false;
+	float m_frozenView[16] = { 0 };
+	float m_frozenProj[16] = { 0 };
 	uint32_t m_frameNo = 0;
 	char m_shotPath[512] = { 0 };
 };
