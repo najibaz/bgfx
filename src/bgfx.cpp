@@ -2806,6 +2806,34 @@ namespace bgfx
 		apiSemPost();
 	}
 
+	// LOCAL PATCH: see waitRenderIdle in bgfx.h.
+	//
+	// Two waits, because the render thread is busy in two stretches and only
+	// the first has a semaphore. renderSemPost() says the frame was submitted;
+	// the flip comes AFTER it, at the top of the next renderFrame(), and a flip
+	// is a present on the queue. m_renderBusyLock is held by the render thread
+	// from the moment it takes a frame until that flip is done.
+	//
+	// The semaphore is taken and put straight back: frame() must still find it,
+	// and it is what guarantees the render thread has taken the frame - and so
+	// the lock - before the lock is asked for here. Without it this could take
+	// and drop the lock before the render thread had woken.
+	void Context::waitRenderIdle()
+	{
+#if BGFX_CONFIG_MULTITHREADED
+		if (m_singleThreaded)
+		{
+			return;
+		}
+
+		renderSemWait();
+		renderSemPost();
+
+		m_renderBusyLock.lock();
+		m_renderBusyLock.unlock();
+#endif // BGFX_CONFIG_MULTITHREADED
+	}
+
 	void Context::swap()
 	{
 		freeDynamicBuffers();
@@ -2922,8 +2950,31 @@ namespace bgfx
 			}
 		}
 
+#if BGFX_CONFIG_MULTITHREADED
+		// LOCAL PATCH: see Context::waitRenderIdle. The previous frame is
+		// submitted and, just above, flipped: nothing of it is left to do.
+		if (m_renderBusy)
+		{
+			m_renderBusy = false;
+			m_renderBusyLock.unlock();
+		}
+#endif // BGFX_CONFIG_MULTITHREADED
+
 		if (apiSemWait(_msecs) )
 		{
+#if BGFX_CONFIG_MULTITHREADED
+			// Not when single-threaded: there is no second thread to keep
+			// out, and no later renderFrame() to give the lock back before
+			// the context is destroyed. Not on the way out either, for the
+			// same reason - the render thread's loop ends after this frame.
+			if (!m_singleThreaded
+			&&  !m_exit)
+			{
+				m_renderBusyLock.lock();
+				m_renderBusy = true;
+			}
+#endif // BGFX_CONFIG_MULTITHREADED
+
 			{
 				BGFX_PROFILER_SCOPE("bgfx/Exec commands pre", kColorResource);
 				rendererExecCommands(m_render->m_cmdPre);
@@ -2969,6 +3020,17 @@ namespace bgfx
 		{
 			return RenderFrame::Timeout;
 		}
+
+#if BGFX_CONFIG_MULTITHREADED
+		// LOCAL PATCH: m_exit can also be set by a command inside the frame just
+		// run, after the lock was taken. This is the last renderFrame() then.
+		if (m_exit
+		&&  m_renderBusy)
+		{
+			m_renderBusy = false;
+			m_renderBusyLock.unlock();
+		}
+#endif // BGFX_CONFIG_MULTITHREADED
 
 		return m_exit
 			? RenderFrame::Exiting
@@ -4662,6 +4724,13 @@ namespace bgfx
 	{
 		BGFX_CHECK_API_THREAD();
 		return s_ctx->frame(_flags);
+	}
+
+	// LOCAL PATCH: see waitRenderIdle in bgfx.h.
+	void waitRenderIdle()
+	{
+		BGFX_CHECK_API_THREAD();
+		s_ctx->waitRenderIdle();
 	}
 
 	const Caps* getCaps()

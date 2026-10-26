@@ -690,6 +690,28 @@ namespace bgfx
 	///
 	void setVulkanExternal(const VulkanExternal& _external);
 
+	/// Blocks until the render thread has finished the frame handed over by
+	/// the last `bgfx::frame` - its commands submitted to the GPU queue and
+	/// its flip done - and is parked waiting for the next one.
+	///
+	/// LOCAL PATCH, not upstream bgfx. In multithreaded mode `bgfx::frame`
+	/// waits for the PREVIOUS frame, hands over the new one and returns, so
+	/// the frame just submitted is still being drawn when it comes back.
+	/// Someone who must know it has reached the queue, or who must use the
+	/// queue themselves, has nothing to wait on: an OpenXR application has to
+	/// release a swapchain image only after the frame that drew into it was
+	/// submitted, and must not have two threads on the VkQueue during
+	/// xrBeginFrame / xrEndFrame / xrAcquireSwapchainImage /
+	/// xrReleaseSwapchainImage. A second, empty `bgfx::frame` answers the
+	/// first and breaks the second: the render thread is then drawing and
+	/// flipping the empty frame while the application talks to the runtime.
+	///
+	/// From here until the next `bgfx::frame` the render thread touches nothing.
+	/// In single-threaded mode the frame is drawn inside `bgfx::frame` and this
+	/// returns at once. Call from the API thread.
+	///
+	void waitRenderIdle();
+
 	/// Platform data.
 	///
 	/// @attention C99's equivalent binding is `bgfx_platform_data_t`.

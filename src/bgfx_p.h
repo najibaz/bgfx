@@ -6345,6 +6345,7 @@ namespace bgfx
 		void freeDynamicBuffers();
 		void freeAllHandles(Frame* _frame);
 		void frameNoRenderWait();
+		void waitRenderIdle(); // LOCAL PATCH, see bgfx.h
 		void swap();
 
 		// render thread
@@ -6437,6 +6438,11 @@ namespace bgfx
 		bx::Mutex     m_encoderApiLock;
 		bx::Mutex     m_encoderBeginLock;
 		bx::Mutex     m_resourceApiLock;
+		// LOCAL PATCH, see Context::waitRenderIdle. Held by the render thread
+		// from taking a frame until its flip is done; m_renderBusy is that
+		// thread's own note of holding it and is read by no one else.
+		bx::Mutex     m_renderBusyLock;
+		bool          m_renderBusy = false;
 		bx::Thread    m_thread;
 #else
 		void apiSemPost()
